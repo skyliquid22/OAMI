@@ -1,0 +1,6 @@
+pytest>=8.0.0
+pytest-cov>=5.0.0
+jupyterlab
+black
+isort
+flake8

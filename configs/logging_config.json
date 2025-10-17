@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "formatters": {
+    "json": {
+      "()": "pythonjsonlogger.jsonlogger.JsonFormatter",
+      "format": "%(asctime)s %(levelname)s %(name)s %(message)s"
+    }
+  },
+  "handlers": {
+    "file": {
+      "class": "logging.FileHandler",
+      "filename": "./logs/oami.log",
+      "formatter": "json"
+    },
+    "console": {
+      "class": "logging.StreamHandler",
+      "formatter": "json"
+    }
+  },
+  "root": {
+    "level": "INFO",
+    "handlers": [
+      "file",
+      "console"
+    ]
+  }
+}
