@@ -2,7 +2,7 @@ polygon:
   api_key: ${env:POLYGON_API_KEY}
 cache:
   root: ./data/csv
-  timeframe: day
+  interval: 1D
 
 features:
   indicators: [SMA, EMA, RSI, MACD, BollingerBands, ATR]
