@@ -13,3 +13,5 @@ logs/
 data/raw/
 data/processed/
 data/cache/
+.idea/
+data/

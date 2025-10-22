@@ -1,7 +1,10 @@
 import pandas as pd
 from sklearn.decomposition import PCA
+
+
 class FeatureSelector:
     def __init__(self, df: pd.DataFrame): self.df = df.copy()
+
     def apply_pca(self, n_components: int = 5) -> pd.DataFrame:
         numeric_df = self.df.select_dtypes('number').dropna()
         if numeric_df.shape[1] == 0:

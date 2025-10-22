@@ -1,6 +1,7 @@
 import pandas as pd
 from .features import FeatureBuilder
-from .options_features import build_options_sentiment
+from .options_features import build_options_sentiment, compute_sentiment_scores
+
 
 def build_unified_dataset(df_market: pd.DataFrame,
                           df_options: pd.DataFrame,
@@ -26,7 +27,14 @@ def build_unified_dataset(df_market: pd.DataFrame,
     mkt['next_return'] = mkt['return'].shift(-1)
 
     # Options sentiment
-    opt = build_options_sentiment(df_options, rolling_windows=tuple(feature_cfg.get('rolling_windows',[5,10,20])))
+    opt = build_options_sentiment(
+        df_options,
+        near_term_days=feature_cfg.get('near_term_days', 7),
+        far_term_days=feature_cfg.get('far_term_days', 30),
+    )
+    if not opt.empty:
+        sentiment_scores = compute_sentiment_scores(opt)
+        opt = opt.merge(sentiment_scores, on='Date', how='left')
 
     # Merge
     merged = pd.merge(mkt, opt.drop_duplicates(subset=['Date']), on='Date', how='left')

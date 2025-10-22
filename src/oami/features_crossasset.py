@@ -1,7 +1,12 @@
 import pandas as pd, numpy as np
+
+
 class CrossAssetFeatures:
     def __init__(self, df: pd.DataFrame, benchmarks: list[str] | None = None):
-        self.df = df.copy().sort_values('Date')
+        frame = df.copy()
+        if "Date" not in frame.columns and "Timestamp" in frame.columns:
+            frame["Date"] = pd.to_datetime(frame["Timestamp"]).dt.normalize()
+        self.df = frame.sort_values('Date')
         self.benchmarks = benchmarks or ['SPY']
 
     def build(self, window: int = 20) -> pd.DataFrame:

@@ -18,7 +18,7 @@ Built for:
 
 ## ⚙️ Core Features
 - 🧩 **Market Data Layer** — Robust Polygon.io integration with retry logic, caching, and error handling  
-- 💾 **Local CSV Caching** — Auto-saves data to `./data/csv/<timeframe>/<ticker>.csv`  
+- 💾 **HDF5 Cache** — Consolidated store at `data/cache/oami_store.h5` for both market bars and per-contract aggregates  
 - 🧮 **Feature Engineering** — SMA, EMA, RSI, MACD, Bollinger Bands, ATR, lags, rolling stats  
 - 📊 **Options Sentiment** — Put/Call ratios, OI ratios, rolling vol metrics, sentiment index  
 - 🔗 **Cross-Asset Context (v0.3)** — SPY/QQQ/VIX correlation and beta placeholders (to be expanded)  
@@ -33,7 +33,7 @@ Built for:
 ```mermaid
 graph LR
     A[Polygon API] --> B[Data Layer]
-    B --> C[CSV Cache]
+    B --> C[HDF5 Cache]
     C --> D[Feature Builder]
     C --> E[Options Sentiment]
     D --> F[Dataset Builder]
@@ -53,7 +53,8 @@ OAMI_v0.3.0/
 │   ├── config.yaml
 │   └── logging_config.json
 ├── data/
-│   └── csv/day/
+│   └── cache/
+│       └── oami_store.h5
 ├── notebooks/
 │   ├── 00_data_ingestion_demo.ipynb
 │   ├── 01_feature_importance.ipynb
@@ -125,15 +126,13 @@ This will automatically:
 
 ## 📈 Example Workflow (Python)
 ```python
-import pandas as pd
+from oami.data_layer import get_market_data, get_options_data
 from oami.features_advanced import AdvancedFeatureBuilder
 
-# Load offline data
-market = pd.read_csv("data/csv/day/SPY.csv", parse_dates=["Date"])
-options = pd.read_csv("data/csv/day/SPY_options.csv", parse_dates=["Date"])
+market = get_market_data("SPY", "2024-01-01", "2024-06-30")
+contracts = get_options_data("SPY", "2024-01-01", "2024-06-30")
 
-# Build advanced features
-afb = AdvancedFeatureBuilder(market, options)
+afb = AdvancedFeatureBuilder(market, contracts)
 df = (afb
       .add_crossasset(benchmarks=["SPY", "VIX"])
       .add_options_implied()

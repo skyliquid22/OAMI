@@ -1,10 +1,8 @@
 import re, logging, pandas as pd, requests
 from datetime import datetime, timedelta, date
 from typing import Dict, List, Tuple
-try:
-    from tqdm.auto import tqdm  # type: ignore
-except ImportError:  # pragma: no cover
-    from tqdm import tqdm  # type: ignore
+from time import perf_counter
+from tqdm import tqdm  # type: ignore
 from polygon import RESTClient
 
 from oami.utils.decorators import retry_request
@@ -14,6 +12,7 @@ from oami.utils.cache_manager import (
     read_hdf,
     write_hdf,
     make_option_key,
+    make_option_contract_key,
     get_timeframe_str,
     make_stock_key,
 )
@@ -87,16 +86,19 @@ def _load_or_fetch_contracts(
 
     interval_key = _normalize_interval(timeframe)
     interval_cfg = INTERVAL_CONFIG[interval_key]
-    timeframe_normalized = interval_key
-    underlying = symbol.upper()
+    timeframe_normalized = cache_manager._sanitize(interval_key)
+    underlying = cache_manager._sanitize(symbol.upper())
 
-    end_year = f"{end_date.year:04d}"
+    end_year_raw = f"{end_date.year:04d}"
     try:
-        end_month = cache_manager.MONTHS[end_date.month - 1]
+        end_month_raw = cache_manager.MONTHS[end_date.month - 1]
     except IndexError as exc:  # pragma: no cover - defensive guard
         raise ValueError("Invalid month extracted from 'to' parameter") from exc
 
-    base_prefix = f"/options/{end_year}/{end_month}/{underlying}/{timeframe_normalized}/"
+    end_year = cache_manager._sanitize(end_year_raw)
+    end_month = cache_manager._sanitize(end_month_raw)
+
+    base_prefix = f"/options/{end_year}/{end_month}/{underlying}/{timeframe_normalized}"
 
     meta_columns = [
         "ticker",
@@ -113,8 +115,15 @@ def _load_or_fetch_contracts(
         """List cached HDF keys for the derived prefix."""
         if not cache_manager.H5_PATH.exists():
             return []
+        legacy_prefix = cache_manager._desanitize_key(base_prefix)
         with pd.HDFStore(cache_manager.H5_PATH, mode="r") as store:
-            return [key for key in store.keys() if key.startswith(base_prefix)]
+            keys: list[str] = []
+            for key in store.keys():
+                if key == base_prefix or key.startswith(f"{base_prefix}/"):
+                    keys.append(key)
+                elif legacy_prefix != base_prefix and (key == legacy_prefix or key.startswith(f"{legacy_prefix}/")):
+                    keys.append(key)
+            return cache_manager._unique(keys)
 
     def _unsanitize_ticker(token: str) -> str:
         """Rehydrate an OCC ticker from the sanitized cache token."""
@@ -123,49 +132,68 @@ def _load_or_fetch_contracts(
         return token
 
     def _build_metadata(keys: list[str]) -> pd.DataFrame:
-        """Parse OCC metadata from cached key names without reading payloads."""
+        """Parse OCC metadata from cached option buckets."""
         records: list[dict[str, object]] = []
+        seen: set[str] = set()
+
         for key in keys:
+            df_bucket = read_hdf(key)
+            if df_bucket.empty:
+                legacy_key = cache_manager._desanitize_key(key)
+                if legacy_key != key:
+                    df_bucket = read_hdf(legacy_key)
+
+            tickers: set[str] = set()
+            if not df_bucket.empty and "ticker" in df_bucket.columns:
+                tickers.update(
+                    pd.Series(df_bucket["ticker"], dtype="string").dropna().astype(str).unique().tolist()
+                )
+
             token = key.rsplit("/", 1)[-1]
-            ticker = _unsanitize_ticker(token)
+            if not tickers and token.startswith("O"):
+                tickers.add(_unsanitize_ticker(token))
 
-            try:
-                occ_meta = parse_occ_ticker(ticker)
-            except ValueError as exc:
-                logging.warning("Skipping unparsable OCC ticker from key", extra={"key": key, "error": str(exc)})
-                continue
+            for ticker in tickers:
+                if ticker in seen:
+                    continue
+                seen.add(ticker)
+                try:
+                    occ_meta = parse_occ_ticker(ticker)
+                except ValueError as exc:
+                    logging.warning("Skipping unparsable OCC ticker", extra={"key": key, "ticker": ticker, "error": str(exc)})
+                    continue
 
-            match = ticker_pattern.match(ticker)
-            if not match:
-                logging.warning("Failed to regex-parse OCC ticker", extra={"ticker": ticker})
-                continue
+                match = ticker_pattern.match(ticker)
+                if not match:
+                    logging.warning("Failed to regex-parse OCC ticker", extra={"ticker": ticker})
+                    continue
 
-            strike_price = int(match.group(6)) / 1000.0
-            if not (strike_floor <= strike_price <= strike_ceiling):
-                continue
+                strike_price = int(match.group(6)) / 1000.0
+                if not (strike_floor <= strike_price <= strike_ceiling):
+                    continue
 
-            contract_type = match.group(5)
-            month_name = occ_meta["month"]
-            try:
-                month_index = cache_manager.MONTHS.index(month_name) + 1
-            except ValueError:
-                logging.warning("Unknown month in OCC metadata", extra={"month": month_name, "ticker": ticker})
-                continue
+                contract_type = match.group(5)
+                month_name = occ_meta["month"]
+                try:
+                    month_index = cache_manager.MONTHS.index(month_name) + 1
+                except ValueError:
+                    logging.warning("Unknown month in OCC metadata", extra={"month": month_name, "ticker": ticker})
+                    continue
 
-            expiration = date(occ_meta["year"], month_index, occ_meta["day"])
-            if expiration < start_date or expiration > end_date:
-                continue
+                expiration = date(occ_meta["year"], month_index, occ_meta["day"])
+                if expiration < start_date or expiration > end_date:
+                    continue
 
-            records.append(
-                {
-                    "ticker": ticker,
-                    "underlying": occ_meta["underlying"],
-                    "contract_type": contract_type,
-                    "strike_price": strike_price,
-                    "date": expiration,
-                    "expiration_date": expiration,
-                }
-            )
+                records.append(
+                    {
+                        "ticker": ticker,
+                        "underlying": occ_meta["underlying"],
+                        "contract_type": "CALL" if contract_type == "C" else "PUT",
+                        "strike_price": strike_price,
+                        "date": expiration,
+                        "expiration_date": expiration,
+                    }
+                )
 
         if not records:
             return pd.DataFrame(columns=meta_columns)
@@ -231,6 +259,7 @@ def _load_or_fetch_contracts(
             },
         )
 
+        fetch_timer = perf_counter()
         tickers = fetch_option_contracts(
             underlying=underlying,
             exp_date_min=new_from_str,
@@ -238,22 +267,31 @@ def _load_or_fetch_contracts(
             strike_min=strike_floor,
             strike_max=strike_ceiling,
         )
+        logging.info(
+            "fetch_option_contracts duration",
+            extra={
+                "symbol": symbol,
+                "from": new_from_str,
+                "to": new_to_str,
+                "seconds": round(perf_counter() - fetch_timer, 3),
+                "tickers": len(tickers),
+            },
+        )
         if not tickers:
             continue
 
-        for ticker in map(str, tickers):
-            start_ts = pd.Timestamp(new_from_str)
-            end_ts = pd.Timestamp(new_to_str)
+        from_pd = pd.Timestamp(new_from_str).tz_localize(None)
+        to_pd = pd.Timestamp(new_to_str).tz_localize(None)
 
+        for ticker in map(str, tickers):
             try:
                 # Ensure OHLCV history exists for the contract and date range; the
                 # helper manages persistence once data is downloaded from Polygon.
                 _load_or_fetch_contract_ohlcv(
                     ticker,
-                    start_ts=start_ts,
-                    end_ts=end_ts,
                     multiplier=multiplier,
                     timespan=timespan,
+                    window_override=(from_pd, to_pd),
                 )
             except Exception as exc:  # pragma: no cover - network/IO failure guard
                 logging.error(
@@ -273,60 +311,82 @@ def _load_or_fetch_contracts(
 
 def _load_or_fetch_contract_ohlcv(
     contract_ticker: str,
-    start_ts: pd.Timestamp,
-    end_ts: pd.Timestamp,
     multiplier: int = 1,
     timespan: str = "day",
+    window_override: tuple[pd.Timestamp, pd.Timestamp] | None = None,
 ) -> pd.DataFrame:
-    """Retrieve OHLCV aggregates for a single OCC contract.
+    """Retrieve OHLCV aggregates for a single OCC contract."""
 
-    Parameters
-    ----------
-    contract_ticker : str
-        OCC-formatted option contract ticker (e.g. ``"O:SPY250117C00470000"``).
-    start_ts : pandas.Timestamp
-        Inclusive lower bound for the aggregate time window.
-    end_ts : pandas.Timestamp
-        Inclusive upper bound for the aggregate time window.
-    multiplier : int, default=1
-        Multiplier for the Polygon aggregate query.
-    timespan : str, default="day"
-        Timespan string understood by Polygon (e.g. ``"day"`` or ``"minute"``).
-
-    Returns
-    -------
-    pandas.DataFrame
-        DataFrame indexed by timestamp ``t`` with open, high, low, close, and
-        volume columns. Empty when neither cache nor API returned data.
-    """
     timeframe = get_timeframe_str(multiplier, timespan)
-    key = make_option_key(contract_ticker, timeframe)
+    bucket_key = make_option_key(contract_ticker, timeframe)
+    contract_key = make_option_contract_key(contract_ticker, timeframe)
 
     price_columns = ["o", "h", "l", "c", "v"]
 
-    df_cached = read_hdf(key)
-    if not df_cached.empty:
-        df_cached = df_cached.copy()
-        if "t" in df_cached.columns and not isinstance(df_cached.index, pd.DatetimeIndex):
-            df_cached.index = pd.to_datetime(df_cached.pop("t"), errors="coerce")
-        elif not isinstance(df_cached.index, pd.DatetimeIndex):
-            df_cached.index = pd.to_datetime(df_cached.index, errors="coerce")
-
-        df_cached = df_cached[~df_cached.index.isna()]
-        df_cached.index = df_cached.index.tz_localize(None)
-        df_cached.index.name = "t"
-        for col in price_columns:
-            if col not in df_cached.columns:
-                df_cached[col] = pd.NA
-        df_cached = df_cached[price_columns]
-
-        if not df_cached.empty:
-            min_cached = df_cached.index.min()
-            max_cached = df_cached.index.max()
-            if min_cached <= start_ts and max_cached >= end_ts:
-                return df_cached.loc[(df_cached.index >= start_ts) & (df_cached.index <= end_ts)]
+    if window_override is not None:
+        start_ts, end_ts = window_override
     else:
-        df_cached = pd.DataFrame(columns=price_columns)
+        occ_info = parse_occ_ticker(contract_ticker)
+        try:
+            month_index = cache_manager.MONTHS.index(occ_info["month"]) + 1
+        except ValueError as exc:  # pragma: no cover - defensive guard
+            raise ValueError(f"Unknown OCC month code in ticker {contract_ticker}") from exc
+
+        expiration = pd.Timestamp(year=occ_info["year"], month=month_index, day=occ_info["day"]).tz_localize(None)
+
+        timespan_lower = timespan.lower()
+        if timespan_lower.startswith("day"):
+            span = pd.Timedelta(days=1)
+        elif timespan_lower.startswith("hour"):
+            span = pd.Timedelta(hours=1)
+        elif timespan_lower.startswith("minute"):
+            span = pd.Timedelta(minutes=1)
+        else:
+            span = pd.Timedelta(days=1)
+
+        start_ts = expiration - span * int(multiplier) * 90
+        end_ts = expiration
+
+    start_ts = pd.Timestamp(start_ts).tz_localize(None)
+    end_ts = pd.Timestamp(end_ts).tz_localize(None)
+
+    def _normalize_bucket(df: pd.DataFrame, default_ticker: str | None = None) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["ticker", "t", *price_columns])
+        tmp = df.copy()
+        if "t" not in tmp.columns:
+            if isinstance(tmp.index, pd.DatetimeIndex):
+                tmp = tmp.reset_index().rename(columns={tmp.index.name or "index": "t"})
+            else:
+                tmp["t"] = pd.to_datetime(tmp.get("t"), errors="coerce")
+        tmp["t"] = pd.to_datetime(tmp["t"], errors="coerce").dt.tz_localize(None)
+        if "ticker" not in tmp.columns:
+            if default_ticker is None:
+                raise ValueError("Option bucket missing ticker column")
+            tmp["ticker"] = default_ticker
+        for col in price_columns:
+            if col not in tmp.columns:
+                tmp[col] = pd.NA
+        tmp = tmp.dropna(subset=["t", "ticker"])
+        tmp = tmp.sort_values(["ticker", "t"]).drop_duplicates(subset=["ticker", "t"], keep="last").reset_index(drop=True)
+        return tmp[["ticker", "t", *price_columns]]
+
+    df_bucket = read_hdf(bucket_key)
+    if df_bucket.empty:
+        legacy_bucket = cache_manager._desanitize_key(bucket_key)
+        if legacy_bucket != bucket_key:
+            df_bucket = read_hdf(legacy_bucket)
+
+    df_bucket = _normalize_bucket(df_bucket, default_ticker=contract_ticker)
+    subset = df_bucket[df_bucket["ticker"] == contract_ticker]
+    subset_window = subset.set_index("t")[price_columns]
+    subset_window = subset_window.sort_index()
+
+    if not subset_window.empty:
+        min_cached = subset_window.index.min()
+        max_cached = subset_window.index.max()
+        if min_cached <= start_ts and max_cached >= end_ts:
+            return subset_window.loc[(subset_window.index >= start_ts) & (subset_window.index <= end_ts)]
 
     url = (
         f"https://api.polygon.io/v2/aggs/ticker/{contract_ticker}/range/"
@@ -347,49 +407,43 @@ def _load_or_fetch_contract_ohlcv(
             "Option contract aggregate request failed",
             extra={"contract": contract_ticker, "error": str(exc)},
         )
-        return df_cached.loc[(df_cached.index >= start_ts) & (df_cached.index <= end_ts)]
+        return subset_window.loc[(subset_window.index >= start_ts) & (subset_window.index <= end_ts)]
 
     if resp.status_code != 200:
         logging.error(
             "Option contract aggregate HTTP error",
             extra={"contract": contract_ticker, "status": resp.status_code, "body": resp.text[:500]},
         )
-        return df_cached.loc[(df_cached.index >= start_ts) & (df_cached.index <= end_ts)]
+        return subset_window.loc[(subset_window.index >= start_ts) & (subset_window.index <= end_ts)]
 
-    payload = resp.json()
-    results = payload.get("results", [])
+    results = resp.json().get("results", [])
     if results:
         df_new = pd.DataFrame(results)
         if "t" not in df_new.columns:
             logging.error("Polygon agg response missing timestamp", extra={"contract": contract_ticker})
-            return df_cached.loc[(df_cached.index >= start_ts) & (df_cached.index <= end_ts)]
+            return subset_window.loc[(subset_window.index >= start_ts) & (subset_window.index <= end_ts)]
 
-        df_new["t"] = pd.to_datetime(df_new["t"], unit="ms", errors="coerce")
+        df_new["t"] = pd.to_datetime(df_new["t"], unit="ms", errors="coerce").dt.tz_localize(None)
         df_new = df_new.dropna(subset=["t"])
-        df_new["t"] = df_new["t"].dt.tz_localize(None)
-        df_new = df_new.set_index("t")
-        df_new.index.name = "t"
-
-        # Ensure the resulting frame contains the expected OHLCV schema.
         for col in price_columns:
             if col not in df_new.columns:
                 df_new[col] = pd.NA
-        df_new = df_new[price_columns]
+        df_new["ticker"] = contract_ticker
+        df_new = df_new[["ticker", "t", *price_columns]]
 
-        combined = pd.concat([df_cached, df_new])
-        combined = combined[~combined.index.duplicated(keep="last")]
-        combined = combined.sort_index()
+        combined = pd.concat([df_bucket, df_new], ignore_index=True)
+        combined = _normalize_bucket(combined)
 
         try:
-            write_hdf(combined, key)
-            logging.info("Cached contract OHLCV", extra={"contract": contract_ticker, "key": key})
+            write_hdf(combined, bucket_key, extra_remove=[contract_key])
+            logging.info("Cached contract OHLCV", extra={"contract": contract_ticker, "key": bucket_key})
         except Exception as exc:
-            logging.error("Failed to cache contract OHLCV", extra={"key": key, "error": str(exc)})
+            logging.error("Failed to cache contract OHLCV", extra={"key": bucket_key, "error": str(exc)})
 
-        df_cached = combined
+        df_bucket = combined
+        subset_window = df_bucket[df_bucket["ticker"] == contract_ticker].set_index("t")[price_columns].sort_index()
 
-    window = df_cached.loc[(df_cached.index >= start_ts) & (df_cached.index <= end_ts)]
-    return window
+    return subset_window.loc[(subset_window.index >= start_ts) & (subset_window.index <= end_ts)]
 
 
 @retry_request(max_retries=3)
@@ -552,24 +606,7 @@ def _interval_delta(interval_key: str) -> pd.Timedelta:
 
 
 def _ensure_market_datetime(df: pd.DataFrame) -> pd.DataFrame:
-    """Standardize timestamp and date columns for market dataframes.
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        Raw market data that may contain ``Timestamp`` or ``Date`` columns.
-
-    Returns
-    -------
-    pandas.DataFrame
-        Copy of ``df`` with normalized ``Timestamp`` and ``Date`` columns. An
-        empty frame is returned when the input is empty.
-
-    Raises
-    ------
-    ValueError
-        Raised when neither ``Timestamp`` nor ``Date`` columns are present.
-    """
+    """Standardize timestamp column for market dataframes."""
     if df is None or df.empty:
         return pd.DataFrame()
     frame = df.copy()
@@ -580,10 +617,7 @@ def _ensure_market_datetime(df: pd.DataFrame) -> pd.DataFrame:
     else:
         raise ValueError("Market dataframe is missing both 'Timestamp' and 'Date' columns.")
     frame["Timestamp"] = frame["Timestamp"].dt.tz_localize(None)
-    if "Date" in frame.columns:
-        frame["Date"] = pd.to_datetime(frame["Date"]).dt.date
-    else:
-        frame["Date"] = frame["Timestamp"].dt.date
+    frame = frame.drop(columns=["Date"], errors="ignore")
     frame = frame.drop_duplicates(subset="Timestamp").sort_values("Timestamp").reset_index(drop=True)
     return frame
 
@@ -621,58 +655,27 @@ def _resolve_window(start: str | pd.Timestamp, end: str | pd.Timestamp, interval
 
 
 def _filter_market_window(df: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp, interval_key: str) -> pd.DataFrame:
-    """Return the slice of market data between start/end for the provided interval.
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        Market data frame to filter.
-    start_ts : pandas.Timestamp
-        Inclusive lower bound.
-    end_ts : pandas.Timestamp
-        Inclusive upper bound.
-    interval_key : str
-        Interval key controlling whether comparisons use dates or timestamps.
-
-    Returns
-    -------
-    pandas.DataFrame
-        Filtered frame containing only rows within the requested window.
-    """
+    """Return the slice of market data between start/end for the provided interval."""
     if df is None or df.empty:
         return pd.DataFrame()
     frame = _ensure_market_datetime(df)
+    ts = frame["Timestamp"]
     if interval_key == "1D":
-        dates = pd.to_datetime(frame["Date"]).dt.normalize()
-        mask = (dates >= start_ts) & (dates <= end_ts)
+        mask = (ts.dt.normalize() >= start_ts.normalize()) & (ts.dt.normalize() <= end_ts.normalize())
     else:
-        mask = (frame["Timestamp"] >= start_ts) & (frame["Timestamp"] <= end_ts)
+        mask = (ts >= start_ts) & (ts <= end_ts)
     return frame.loc[mask].reset_index(drop=True)
 
 
 def _cache_market_bounds(df: pd.DataFrame, interval_key: str) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
-    """Return the minimum and maximum timestamp/date stored for market data.
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        Cached market data frame.
-    interval_key : str
-        Interval key used to determine whether to inspect ``Timestamp`` or ``Date``.
-
-    Returns
-    -------
-    tuple of pandas.Timestamp or None
-        Tuple ``(min_timestamp, max_timestamp)`` or ``(None, None)`` when the
-        frame is empty.
-    """
+    """Return the minimum and maximum timestamp stored for market data."""
     if df is None or df.empty:
         return None, None
     frame = _ensure_market_datetime(df)
+    ts = frame["Timestamp"]
     if interval_key == "1D":
-        dates = pd.to_datetime(frame["Date"]).dt.normalize()
-        return dates.min(), dates.max()
-    return frame["Timestamp"].min(), frame["Timestamp"].max()
+        ts = ts.dt.normalize()
+    return ts.min(), ts.max()
 
 
 @retry_request(max_retries=3)
@@ -723,7 +726,6 @@ def fetch_market_data(symbol: str, start: str, end: str, interval: str | None = 
 
             data.append({
                 "Timestamp": timestamp,
-                "Date": timestamp.date(),
                 "Open": bar.open,
                 "High": bar.high,
                 "Low": bar.low,
@@ -791,12 +793,14 @@ def get_market_data(symbol: str, start: str, end: str, interval: str | None = No
                 return _filter_market_window(cached_full, start_ts, end_ts, interval_key)
 
     # Cache miss or partial coverage—request the missing portion directly from Polygon.
-    df = fetch_market_data(
-        symbol,
-        start_ts.strftime("%Y-%m-%d") if interval_key == "1D" else start_ts.isoformat(),
-        end_ts.strftime("%Y-%m-%d") if interval_key == "1D" else end_ts.isoformat(),
-        interval=interval_key,
-    )
+    with _progress([0], desc=f"Market data {symbol}", leave=False) as progress:
+        df = fetch_market_data(
+            symbol,
+            start_ts.strftime("%Y-%m-%d") if interval_key == "1D" else start_ts.isoformat(),
+            end_ts.strftime("%Y-%m-%d") if interval_key == "1D" else end_ts.isoformat(),
+            interval=interval_key,
+        )
+        progress.update(1)
     if df.empty:
         logging.warning(f"No market data retrieved for {symbol}", extra={"interval": interval_key})
         return pd.DataFrame()
@@ -804,7 +808,8 @@ def get_market_data(symbol: str, start: str, end: str, interval: str | None = No
     combined = pd.concat([cached_full, df], ignore_index=True) if not cached_full.empty else df
     combined = _ensure_market_datetime(combined)
     write_hdf(combined, market_key)
-    return _filter_market_window(combined, start_ts, end_ts, interval_key)
+    window = _filter_market_window(combined, start_ts, end_ts, interval_key)
+    return window
 
 
 def get_options_data(
@@ -813,7 +818,7 @@ def get_options_data(
     end_date: str,
     interval: str | None = None,
     use_cache: bool = True,
-    look_forward: int = 7,
+    look_forward: int = 30,
     strike_bounds: float = 0.05,
 ) -> pd.DataFrame:
     """Return OCC contract metadata for the requested window.
@@ -832,7 +837,7 @@ def get_options_data(
     use_cache : bool, default=True
         When ``True`` both the market data lookup and contract loader will
         consult cached data before calling external services.
-    look_forward : int, default=7
+    look_forward : int, default=30
         Number of interval units to project forward when choosing option
         expirations. Helps ensure contracts expiring shortly after the window
         remain available downstream.
@@ -860,7 +865,15 @@ def get_options_data(
         )
         return pd.DataFrame()
 
+    market_timer = perf_counter()
     market_df = get_market_data(symbol, start_date, end_date, interval=interval_key, use_cache=use_cache)
+    logging.info(
+        "get_market_data duration",
+        extra={
+            "symbol": symbol,
+            "seconds": round(perf_counter() - market_timer, 3),
+        },
+    )
     if market_df.empty:
         logging.warning(
             "Unable to compute strike bounds due to missing market data",
@@ -917,15 +930,14 @@ def get_options_data(
     forward_multiplier = max(0, look_forward)
     forward_delta = step * forward_multiplier
 
-    from_ts = start_ts + forward_delta
+    from_ts = start_ts
     to_ts = end_ts + forward_delta
 
     from_str = from_ts.date().isoformat()
     to_str = to_ts.date().isoformat()
 
     try:
-        # Use the derived window and strike filters to retrieve cached contracts,
-        # backfilling the HDF store when required.
+        contracts_timer = perf_counter()
         contracts_df = _load_or_fetch_contracts(
             symbol=symbol,
             timeframe=interval_key,
@@ -933,6 +945,16 @@ def get_options_data(
             to=to_str,
             strike_min=strike_min,
             strike_max=strike_max,
+        )
+        logging.info(
+            "_load_or_fetch_contracts duration",
+            extra={
+                "symbol": symbol,
+                "from": from_str,
+                "to": to_str,
+                "seconds": round(perf_counter() - contracts_timer, 3),
+                "contracts": len(contracts_df),
+            },
         )
     except ValueError as exc:
         logging.error(
@@ -951,5 +973,76 @@ def get_options_data(
                 "look_forward": forward_multiplier,
             },
         )
+        return contracts_df
 
-    return contracts_df
+    multiplier = int(INTERVAL_CONFIG[interval_key]["multiplier"])  # type: ignore[call-overload]
+    timespan = str(INTERVAL_CONFIG[interval_key]["timespan"])  # type: ignore[call-overload]
+
+    enriched_rows: list[pd.Series] = []
+    records = contracts_df.to_dict("records")
+    total_contracts = len(records)
+    progress_iter = _progress(records, desc=f"Option OHLCV {symbol}", total=total_contracts, leave=False)
+    enrich_total = 0.0
+    for idx, record in enumerate(progress_iter, start=1):
+        row = pd.Series(record)
+        ticker = row.get("ticker")
+        if not isinstance(ticker, str):
+            progress_iter.set_postfix_str(f"{idx}/{total_contracts}")
+            continue
+
+        single_start = perf_counter()
+        try:
+            ohlcv_df = _load_or_fetch_contract_ohlcv(
+                contract_ticker=ticker,
+                multiplier=multiplier,
+                timespan=timespan,
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            logging.error(
+                "Failed to load contract OHLCV",
+                extra={"ticker": ticker, "from": from_str, "to": to_str, "error": str(exc)},
+            )
+            progress_iter.set_postfix_str(f"{idx}/{total_contracts}")
+            continue
+
+        enrich_total += perf_counter() - single_start
+
+        enriched = row.copy()
+        enriched["ohlcv"] = ohlcv_df
+        enriched_rows.append(enriched)
+        progress_iter.set_postfix_str(f"{idx}/{total_contracts}")
+
+    if not enriched_rows:
+        logging.warning(
+            "No contract OHLCV data available after enrichment",
+            extra={"symbol": symbol, "from": from_str, "to": to_str},
+        )
+        return pd.DataFrame()
+
+    logging.info(
+        "_load_or_fetch_contract_ohlcv total duration",
+        extra={
+            "symbol": symbol,
+            "contracts": len(enriched_rows),
+            "seconds": round(enrich_total, 3),
+        },
+    )
+
+    result = pd.DataFrame(enriched_rows)
+    drop_cols = ["underlying", "contract_type", "strike_price", "date", "expiration_date"]
+    if not result.empty:
+        result = result.drop(columns=drop_cols, errors="ignore")
+    return result
+
+
+def _progress(iterable, *, desc: str, total: int | None = None, leave: bool = False):
+    """Return a tqdm iterator configured for console/Jupyter friendly output."""
+    return tqdm(
+        iterable,
+        desc=desc,
+        total=total,
+        leave=leave,
+        dynamic_ncols=True,
+        miniters=1,
+        ascii=True,
+    )

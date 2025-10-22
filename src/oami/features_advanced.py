@@ -1,7 +1,8 @@
 import pandas as pd
 from .features_crossasset import CrossAssetFeatures
-from .options_features import build_options_sentiment
+from .options_features import build_options_sentiment, compute_sentiment_scores
 from .features_select import FeatureSelector
+
 
 class AdvancedFeatureBuilder:
     def __init__(self, market_df: pd.DataFrame, options_df: pd.DataFrame | None = None):
@@ -13,9 +14,16 @@ class AdvancedFeatureBuilder:
         self.market_df = caf.build()
         return self
 
-    def add_options_implied(self) -> 'AdvancedFeatureBuilder':
+    def add_options_implied(self, near_term_days: int = 7, far_term_days: int = 30) -> 'AdvancedFeatureBuilder':
         if self.options_df is not None:
-            enhanced = build_options_sentiment(self.options_df)
+            enhanced = build_options_sentiment(
+                self.options_df,
+                near_term_days=near_term_days,
+                far_term_days=far_term_days,
+            )
+            if not enhanced.empty:
+                scores = compute_sentiment_scores(enhanced)
+                enhanced = enhanced.merge(scores, on='Date', how='left')
             self.market_df = pd.merge(self.market_df, enhanced, on='Date', how='left')
         return self
 
