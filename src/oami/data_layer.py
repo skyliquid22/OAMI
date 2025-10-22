@@ -37,7 +37,9 @@ def _load_or_fetch_contracts(
     to: str,
     strike_min: float,
     strike_max: float,
-) -> pd.DataFrame:
+    bucket_cache: dict[str, pd.DataFrame] | None = None,
+    bucket_removals: dict[str, set[str]] | None = None,
+) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], dict[str, set[str]]]:
     """Return cached option contracts and backfill cache gaps on demand.
 
     Parameters
@@ -99,6 +101,15 @@ def _load_or_fetch_contracts(
     end_month = cache_manager._sanitize(end_month_raw)
 
     base_prefix = f"/options/{end_year}/{end_month}/{underlying}/{timeframe_normalized}"
+
+    if bucket_cache is None:
+        bucket_cache = {}
+    if bucket_removals is None:
+        bucket_removals = {}
+    if bucket_cache is None:
+        bucket_cache = {}
+    if bucket_removals is None:
+        bucket_removals = {}
 
     meta_columns = [
         "ticker",
@@ -228,7 +239,7 @@ def _load_or_fetch_contracts(
         and min_cached <= start_date
         and max_cached >= end_date
     ):
-        return cached_meta
+        return cached_meta, bucket_cache, bucket_removals
 
     missing_dates.sort()
     missing_ranges: list[tuple[date, date]] = []
@@ -246,7 +257,8 @@ def _load_or_fetch_contracts(
     multiplier = int(interval_cfg["multiplier"])  # type: ignore[call-overload]
     timespan = str(interval_cfg["timespan"])  # type: ignore[call-overload]
 
-    for range_start, range_end in missing_ranges:
+    range_iter = _progress(missing_ranges, desc=f"Backfill ranges {symbol}", total=len(missing_ranges), leave=False)
+    for range_start, range_end in range_iter:
         new_from_str = range_start.isoformat()
         new_to_str = range_end.isoformat()
         logging.info(
@@ -277,13 +289,15 @@ def _load_or_fetch_contracts(
                 "tickers": len(tickers),
             },
         )
+        range_iter.set_postfix_str(f"tickers={len(tickers)}")
         if not tickers:
             continue
 
         from_pd = pd.Timestamp(new_from_str).tz_localize(None)
         to_pd = pd.Timestamp(new_to_str).tz_localize(None)
 
-        for ticker in map(str, tickers):
+        contract_iter = _progress(list(map(str, tickers)), desc=f"Option OHLCV {symbol}", total=len(tickers), leave=False)
+        for ticker in contract_iter:
             try:
                 # Ensure OHLCV history exists for the contract and date range; the
                 # helper manages persistence once data is downloaded from Polygon.
@@ -292,6 +306,8 @@ def _load_or_fetch_contracts(
                     multiplier=multiplier,
                     timespan=timespan,
                     window_override=(from_pd, to_pd),
+                    bucket_cache=bucket_cache,
+                    bucket_removals=bucket_removals,
                 )
             except Exception as exc:  # pragma: no cover - network/IO failure guard
                 logging.error(
@@ -299,14 +315,15 @@ def _load_or_fetch_contracts(
                     extra={"ticker": ticker, "from": new_from_str, "to": new_to_str, "error": str(exc)},
                 )
                 continue
+            contract_iter.set_postfix_str(ticker)
 
     updated_keys = _list_option_keys()
     updated_meta = _build_metadata(updated_keys)
 
     if updated_meta.empty:
-        return cached_meta
+        return cached_meta, bucket_cache, bucket_removals
 
-    return updated_meta
+    return updated_meta, bucket_cache, bucket_removals
 
 
 def _load_or_fetch_contract_ohlcv(
@@ -314,11 +331,19 @@ def _load_or_fetch_contract_ohlcv(
     multiplier: int = 1,
     timespan: str = "day",
     window_override: tuple[pd.Timestamp, pd.Timestamp] | None = None,
+    bucket_cache: dict[str, pd.DataFrame] | None = None,
+    bucket_removals: dict[str, set[str]] | None = None,
 ) -> pd.DataFrame:
     """Retrieve OHLCV aggregates for a single OCC contract."""
 
+    if bucket_cache is None:
+        bucket_cache = {}
+    if bucket_removals is None:
+        bucket_removals = {}
+
     timeframe = get_timeframe_str(multiplier, timespan)
     bucket_key = make_option_key(contract_ticker, timeframe)
+    legacy_bucket_key = cache_manager._desanitize_key(bucket_key)
     contract_key = make_option_contract_key(contract_ticker, timeframe)
 
     price_columns = ["o", "h", "l", "c", "v"]
@@ -350,7 +375,7 @@ def _load_or_fetch_contract_ohlcv(
     start_ts = pd.Timestamp(start_ts).tz_localize(None)
     end_ts = pd.Timestamp(end_ts).tz_localize(None)
 
-    def _normalize_bucket(df: pd.DataFrame, default_ticker: str | None = None) -> pd.DataFrame:
+    def _normalize_bucket(df: pd.DataFrame) -> pd.DataFrame:
         if df is None or df.empty:
             return pd.DataFrame(columns=["ticker", "t", *price_columns])
         tmp = df.copy()
@@ -361,9 +386,7 @@ def _load_or_fetch_contract_ohlcv(
                 tmp["t"] = pd.to_datetime(tmp.get("t"), errors="coerce")
         tmp["t"] = pd.to_datetime(tmp["t"], errors="coerce").dt.tz_localize(None)
         if "ticker" not in tmp.columns:
-            if default_ticker is None:
-                raise ValueError("Option bucket missing ticker column")
-            tmp["ticker"] = default_ticker
+            tmp["ticker"] = contract_ticker
         for col in price_columns:
             if col not in tmp.columns:
                 tmp[col] = pd.NA
@@ -371,14 +394,16 @@ def _load_or_fetch_contract_ohlcv(
         tmp = tmp.sort_values(["ticker", "t"]).drop_duplicates(subset=["ticker", "t"], keep="last").reset_index(drop=True)
         return tmp[["ticker", "t", *price_columns]]
 
-    df_bucket = read_hdf(bucket_key)
-    if df_bucket.empty:
-        legacy_bucket = cache_manager._desanitize_key(bucket_key)
-        if legacy_bucket != bucket_key:
-            df_bucket = read_hdf(legacy_bucket)
+    if bucket_key in bucket_cache:
+        df_bucket = bucket_cache[bucket_key]
+    else:
+        df_bucket = read_hdf(bucket_key)
+        if df_bucket.empty and legacy_bucket_key != bucket_key:
+            df_bucket = read_hdf(legacy_bucket_key)
+        df_bucket = _normalize_bucket(df_bucket)
+        bucket_cache[bucket_key] = df_bucket
 
-    df_bucket = _normalize_bucket(df_bucket, default_ticker=contract_ticker)
-    subset = df_bucket[df_bucket["ticker"] == contract_ticker]
+    subset = bucket_cache[bucket_key][bucket_cache[bucket_key]["ticker"] == contract_ticker]
     subset_window = subset.set_index("t")[price_columns]
     subset_window = subset_window.sort_index()
 
@@ -431,17 +456,15 @@ def _load_or_fetch_contract_ohlcv(
         df_new["ticker"] = contract_ticker
         df_new = df_new[["ticker", "t", *price_columns]]
 
-        combined = pd.concat([df_bucket, df_new], ignore_index=True)
+        if bucket_cache[bucket_key].empty:
+            combined = df_new.copy()
+        else:
+            combined = pd.concat([bucket_cache[bucket_key], df_new], ignore_index=True)
         combined = _normalize_bucket(combined)
+        bucket_cache[bucket_key] = combined
+        bucket_removals.setdefault(bucket_key, set()).add(contract_key)
 
-        try:
-            write_hdf(combined, bucket_key, extra_remove=[contract_key])
-            logging.info("Cached contract OHLCV", extra={"contract": contract_ticker, "key": bucket_key})
-        except Exception as exc:
-            logging.error("Failed to cache contract OHLCV", extra={"key": bucket_key, "error": str(exc)})
-
-        df_bucket = combined
-        subset_window = df_bucket[df_bucket["ticker"] == contract_ticker].set_index("t")[price_columns].sort_index()
+        subset_window = combined[combined["ticker"] == contract_ticker].set_index("t")[price_columns].sort_index()
 
     return subset_window.loc[(subset_window.index >= start_ts) & (subset_window.index <= end_ts)]
 
@@ -936,15 +959,20 @@ def get_options_data(
     from_str = from_ts.date().isoformat()
     to_str = to_ts.date().isoformat()
 
+    bucket_cache: dict[str, pd.DataFrame] = {}
+    bucket_removals: dict[str, set[str]] = {}
+
     try:
         contracts_timer = perf_counter()
-        contracts_df = _load_or_fetch_contracts(
+        contracts_df, bucket_cache, bucket_removals = _load_or_fetch_contracts(
             symbol=symbol,
             timeframe=interval_key,
             from_=from_str,
             to=to_str,
             strike_min=strike_min,
             strike_max=strike_max,
+            bucket_cache=bucket_cache,
+            bucket_removals=bucket_removals,
         )
         logging.info(
             "_load_or_fetch_contracts duration",
@@ -961,6 +989,7 @@ def get_options_data(
             "Failed to load option contracts",
             extra={"symbol": symbol, "from": from_str, "to": to_str, "error": str(exc)},
         )
+        _persist_option_buckets(bucket_cache, bucket_removals)
         return pd.DataFrame()
 
     if contracts_df.empty:
@@ -973,6 +1002,7 @@ def get_options_data(
                 "look_forward": forward_multiplier,
             },
         )
+        _persist_option_buckets(bucket_cache, bucket_removals)
         return contracts_df
 
     multiplier = int(INTERVAL_CONFIG[interval_key]["multiplier"])  # type: ignore[call-overload]
@@ -996,6 +1026,8 @@ def get_options_data(
                 contract_ticker=ticker,
                 multiplier=multiplier,
                 timespan=timespan,
+                bucket_cache=bucket_cache,
+                bucket_removals=bucket_removals,
             )
         except Exception as exc:  # pragma: no cover - defensive guard
             logging.error(
@@ -1017,6 +1049,7 @@ def get_options_data(
             "No contract OHLCV data available after enrichment",
             extra={"symbol": symbol, "from": from_str, "to": to_str},
         )
+        _persist_option_buckets(bucket_cache, bucket_removals)
         return pd.DataFrame()
 
     logging.info(
@@ -1027,6 +1060,8 @@ def get_options_data(
             "seconds": round(enrich_total, 3),
         },
     )
+
+    _persist_option_buckets(bucket_cache, bucket_removals)
 
     result = pd.DataFrame(enriched_rows)
     drop_cols = ["underlying", "contract_type", "strike_price", "date", "expiration_date"]
@@ -1046,3 +1081,21 @@ def _progress(iterable, *, desc: str, total: int | None = None, leave: bool = Fa
         miniters=1,
         ascii=True,
     )
+
+
+def _persist_option_buckets(
+    bucket_cache: dict[str, pd.DataFrame],
+    bucket_removals: dict[str, set[str]],
+) -> None:
+    if not bucket_cache:
+        return
+    for key, df in bucket_cache.items():
+        try:
+            remove_keys = list(bucket_removals.get(key, set()))
+            write_hdf(df, key, extra_remove=remove_keys)
+            logging.info(
+                "Persisted option bucket",
+                extra={"key": key, "rows": len(df)},
+            )
+        except Exception as exc:
+            logging.error("Failed to persist option bucket", extra={"key": key, "error": str(exc)})
