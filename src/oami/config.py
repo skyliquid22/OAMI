@@ -18,10 +18,11 @@ from oami.logging_config import setup_json_logging
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
+
 @dataclass
 class Settings:
     api_key: str = os.getenv("POLYGON_API_KEY", "YOUR_KEY_HERE")
-    cache_root: str = str(PROJECT_ROOT / "data" / "csv")
+    cache_root: str = str(PROJECT_ROOT / "data")
     default_interval: str = "1D"
     log_file: str = str(PROJECT_ROOT / "logs" / "oami.log")
 
@@ -64,3 +65,6 @@ def initialize_environment() -> str:
         print("✅ Polygon API key detected and loaded.")
 
     return api_key
+
+
+SET = Settings()

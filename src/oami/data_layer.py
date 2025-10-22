@@ -1,20 +1,21 @@
-import time, random, logging, pandas as pd, requests
-from datetime import datetime
+import re, logging, pandas as pd, requests
+from datetime import datetime, timedelta, date
 from typing import Dict, List, Tuple
 try:
     from tqdm.auto import tqdm  # type: ignore
 except ImportError:  # pragma: no cover
     from tqdm import tqdm  # type: ignore
 from polygon import RESTClient
-from polygon.exceptions import BadResponse
 
+from oami.utils.decorators import retry_request
+from oami.utils import cache_manager
 from oami.utils.cache_manager import (
-    load_cache,
-    save_cache,
+    parse_occ_ticker,
     read_hdf,
     write_hdf,
     make_option_key,
     get_timeframe_str,
+    make_stock_key,
 )
 
 from .config import Settings
@@ -29,166 +30,308 @@ INTERVAL_CONFIG: dict[str, dict[str, object]] = {
     "1D": {"timespan": "day", "multiplier": 1, "delta": pd.Timedelta(days=1)},
 }
 
-_FIRST_OPTIONS_REQUEST_LOGGED: set[str] = set()
 
-
-def _contracts_key(symbol: str) -> str:
-    return f"/options/contracts/{symbol.upper()}"
-
-
-def _load_or_fetch_contracts(symbol: str, as_of: str | None = None) -> pd.DataFrame:
-    """Load contract metadata for a date, fetching and persisting when missing."""
-    columns = ["ticker", "contract_type", "expiration_date", "strike_price"]
-    key = _contracts_key(symbol)
-
-    df_cached = read_hdf(key)
-    if df_cached.empty:
-        df_cached = pd.DataFrame(columns=columns)
-    else:
-        df_cached = df_cached.reindex(columns=columns, fill_value=pd.NA)
-
-    if as_of:
-        df_raw = fetch_option_contracts(symbol, as_of)
-    else:
-        df_raw = pd.DataFrame()
-
-    if not df_raw.empty:
-        df_new = df_raw.reindex(columns=columns, fill_value=pd.NA)
-        if df_cached.empty:
-            df_cached = df_new
-        else:
-            df_cached = pd.concat([df_cached, df_new], ignore_index=True)
-            df_cached = df_cached.drop_duplicates(subset=["ticker"], keep="last").reset_index(drop=True)
-        try:
-            write_hdf(df_cached, key)
-            logging.info("Cached option contracts", extra={"symbol": symbol, "key": key})
-        except Exception as exc:
-            logging.error("Failed to cache contracts", extra={"key": key, "error": str(exc)})
-
-    for col in columns:
-        if col not in df_cached.columns:
-            df_cached[col] = pd.NA
-    return df_cached[columns].copy()
-
-
-
-def retry_request(max_retries: int = 3, base_delay: float = 1.0, jitter: float = 0.3, backoff: float = 2.0):
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            delay = base_delay
-            for attempt in range(1, max_retries + 1):
-                try:
-                    result = func(*args, **kwargs)
-                    logging.info("Polygon call succeeded", extra={"function": func.__name__, "attempt": attempt})
-                    return result
-                except (BadResponse, requests.exceptions.RequestException) as e:
-                    logging.warning("Polygon API/network error", extra={"function": func.__name__, "attempt": attempt, "error": str(e)})
-                except Exception as e:
-                    logging.error("Unexpected error", extra={"function": func.__name__, "attempt": attempt, "error": str(e)})
-                if attempt < max_retries:
-                    sleep_time = delay + random.uniform(0, jitter)
-                    logging.info("Retrying Polygon API call", extra={"function": func.__name__, "attempt": attempt, "next_delay": sleep_time})
-                    time.sleep(sleep_time); delay *= backoff
-            logging.error("Polygon call failed after retries", extra={"function": func.__name__}); return None
-        return wrapper
-    return decorator
-
-@retry_request(max_retries=3)
-def fetch_option_contracts(symbol: str, as_of: str, limit: int = 1000) -> pd.DataFrame:
-    """
-    Fetch contract metadata for the given underlying and as_of date using Polygon's reference endpoint.
-    Handles pagination via `next_url`.
-    """
-    base_url = "https://api.polygon.io/v3/reference/options/contracts"
-    params = {
-        "underlying_ticker": symbol,
-        "as_of": as_of,
-        "limit": limit,
-        "apiKey": SET.api_key,
-    }
-    url = base_url
-    all_results: List[Dict] = []
-    first_page = True
-
-    while url:
-        logging.info(
-            "Fetching option contracts",
-            extra={"symbol": symbol, "as_of": as_of, "url": url if first_page else "next_url"},
-        )
-        try:
-            resp = requests.get(url, params=params if first_page else None)
-        except requests.exceptions.RequestException as exc:
-            logging.error("Option contracts request failed", extra={"symbol": symbol, "error": str(exc)})
-            return pd.DataFrame()
-
-        if resp.status_code != 200:
-            logging.error(
-                "Option contracts HTTP error",
-                extra={"symbol": symbol, "status": resp.status_code, "body": resp.text[:500]},
-            )
-            return pd.DataFrame()
-
-        payload = resp.json()
-        if first_page and symbol not in _FIRST_OPTIONS_REQUEST_LOGGED:
-            _FIRST_OPTIONS_REQUEST_LOGGED.add(symbol)
-        results = payload.get("results", [])
-        all_results.extend(results)
-
-        next_url = payload.get("next_url")
-        if not next_url:
-            break
-
-        url = next_url
-        params = None
-        if "apiKey" not in url:
-            connector = "&" if "?" in url else "?"
-            url = f"{url}{connector}apiKey={SET.api_key}"
-        first_page = False
-
-    if not all_results:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(all_results)
-    df["as_of"] = pd.to_datetime(as_of)
-    return df
-
-
-@retry_request(max_retries=3)
-def fetch_option_contract_agg(
+def _load_or_fetch_contracts(
     symbol: str,
+    timeframe: str,
+    from_: str,
+    to: str,
+    strike_min: float,
+    strike_max: float,
+) -> pd.DataFrame:
+    """Return cached option contracts and backfill cache gaps on demand.
+
+    Parameters
+    ----------
+    symbol : str
+        Underlying ticker symbol associated with the options contracts.
+    timeframe : str
+        Timeframe code (e.g. ``"1D"``) used to determine which cache partition
+        to inspect.
+    from_ : str
+        Inclusive ISO date string used as the lower bound for contract expiry
+        selection.
+    to : str
+        Inclusive ISO date string used as the upper bound for contract expiry
+        selection.
+    strike_min : float
+        Minimum strike price (inclusive) to accept when scanning the cache.
+    strike_max : float
+        Maximum strike price (inclusive) to accept when scanning the cache.
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame containing OCC tickers and parsed metadata columns. The frame
+        is empty when no contracts meet the supplied filters.
+
+    Raises
+    ------
+    ValueError
+        Raised when supplied dates or strike bounds are invalid.
+    """
+
+    try:
+        start_date = pd.to_datetime(from_).date()
+        end_date = pd.to_datetime(to).date()
+    except (TypeError, ValueError) as exc:  # pragma: no cover - defensive guard
+        raise ValueError("Invalid ISO date supplied to _load_or_fetch_contracts") from exc
+
+    if start_date > end_date:
+        raise ValueError("Parameter 'from_' must be on or before 'to'")
+
+    strike_floor = float(strike_min)
+    strike_ceiling = float(strike_max)
+    if strike_floor > strike_ceiling:
+        raise ValueError("Parameter 'strike_min' must be <= 'strike_max'")
+
+    interval_key = _normalize_interval(timeframe)
+    interval_cfg = INTERVAL_CONFIG[interval_key]
+    timeframe_normalized = interval_key
+    underlying = symbol.upper()
+
+    end_year = f"{end_date.year:04d}"
+    try:
+        end_month = cache_manager.MONTHS[end_date.month - 1]
+    except IndexError as exc:  # pragma: no cover - defensive guard
+        raise ValueError("Invalid month extracted from 'to' parameter") from exc
+
+    base_prefix = f"/options/{end_year}/{end_month}/{underlying}/{timeframe_normalized}/"
+
+    meta_columns = [
+        "ticker",
+        "underlying",
+        "contract_type",
+        "strike_price",
+        "date",
+        "expiration_date",
+    ]
+
+    ticker_pattern = re.compile(r"O:([A-Z]{1,6})(\d{2})(\d{2})(\d{2})([CP])(\d{8})")
+
+    def _list_option_keys() -> list[str]:
+        """List cached HDF keys for the derived prefix."""
+        if not cache_manager.H5_PATH.exists():
+            return []
+        with pd.HDFStore(cache_manager.H5_PATH, mode="r") as store:
+            return [key for key in store.keys() if key.startswith(base_prefix)]
+
+    def _unsanitize_ticker(token: str) -> str:
+        """Rehydrate an OCC ticker from the sanitized cache token."""
+        if token.startswith("O_"):
+            return "O:" + token[2:]
+        return token
+
+    def _build_metadata(keys: list[str]) -> pd.DataFrame:
+        """Parse OCC metadata from cached key names without reading payloads."""
+        records: list[dict[str, object]] = []
+        for key in keys:
+            token = key.rsplit("/", 1)[-1]
+            ticker = _unsanitize_ticker(token)
+
+            try:
+                occ_meta = parse_occ_ticker(ticker)
+            except ValueError as exc:
+                logging.warning("Skipping unparsable OCC ticker from key", extra={"key": key, "error": str(exc)})
+                continue
+
+            match = ticker_pattern.match(ticker)
+            if not match:
+                logging.warning("Failed to regex-parse OCC ticker", extra={"ticker": ticker})
+                continue
+
+            strike_price = int(match.group(6)) / 1000.0
+            if not (strike_floor <= strike_price <= strike_ceiling):
+                continue
+
+            contract_type = match.group(5)
+            month_name = occ_meta["month"]
+            try:
+                month_index = cache_manager.MONTHS.index(month_name) + 1
+            except ValueError:
+                logging.warning("Unknown month in OCC metadata", extra={"month": month_name, "ticker": ticker})
+                continue
+
+            expiration = date(occ_meta["year"], month_index, occ_meta["day"])
+            if expiration < start_date or expiration > end_date:
+                continue
+
+            records.append(
+                {
+                    "ticker": ticker,
+                    "underlying": occ_meta["underlying"],
+                    "contract_type": contract_type,
+                    "strike_price": strike_price,
+                    "date": expiration,
+                    "expiration_date": expiration,
+                }
+            )
+
+        if not records:
+            return pd.DataFrame(columns=meta_columns)
+
+        frame = pd.DataFrame(records)
+        frame = frame.drop_duplicates(subset="ticker", keep="last")
+        frame = frame.sort_values(["date", "ticker"]).reset_index(drop=True)
+        return frame
+
+    def _compute_missing_dates(meta_df: pd.DataFrame) -> list[date]:
+        """Determine which expiry dates are absent from the cached metadata."""
+        requested_dates = [d.date() for d in pd.date_range(start_date, end_date, freq="D")]
+        if meta_df.empty:
+            return requested_dates
+        available_dates = set(meta_df["date"].tolist())
+        return [d for d in requested_dates if d not in available_dates]
+
+    option_keys = _list_option_keys()
+    cached_meta = _build_metadata(option_keys)
+
+    if not cached_meta.empty:
+        min_cached = cached_meta["date"].min()
+        max_cached = cached_meta["date"].max()
+    else:
+        min_cached = max_cached = None
+
+    missing_dates = _compute_missing_dates(cached_meta)
+    if (
+        not missing_dates
+        and min_cached is not None
+        and max_cached is not None
+        and min_cached <= start_date
+        and max_cached >= end_date
+    ):
+        return cached_meta
+
+    missing_dates.sort()
+    missing_ranges: list[tuple[date, date]] = []
+    if missing_dates:
+        range_start = missing_dates[0]
+        range_end = missing_dates[0]
+        for current in missing_dates[1:]:
+            if current == range_end + timedelta(days=1):
+                range_end = current
+            else:
+                missing_ranges.append((range_start, range_end))
+                range_start = range_end = current
+        missing_ranges.append((range_start, range_end))
+
+    multiplier = int(interval_cfg["multiplier"])  # type: ignore[call-overload]
+    timespan = str(interval_cfg["timespan"])  # type: ignore[call-overload]
+
+    for range_start, range_end in missing_ranges:
+        new_from_str = range_start.isoformat()
+        new_to_str = range_end.isoformat()
+        logging.info(
+            "Backfilling option contracts",
+            extra={
+                "symbol": symbol,
+                "from": new_from_str,
+                "to": new_to_str,
+                "timeframe": timeframe_normalized,
+            },
+        )
+
+        tickers = fetch_option_contracts(
+            underlying=underlying,
+            exp_date_min=new_from_str,
+            exp_date_max=new_to_str,
+            strike_min=strike_floor,
+            strike_max=strike_ceiling,
+        )
+        if not tickers:
+            continue
+
+        for ticker in map(str, tickers):
+            start_ts = pd.Timestamp(new_from_str)
+            end_ts = pd.Timestamp(new_to_str)
+
+            try:
+                # Ensure OHLCV history exists for the contract and date range; the
+                # helper manages persistence once data is downloaded from Polygon.
+                _load_or_fetch_contract_ohlcv(
+                    ticker,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    multiplier=multiplier,
+                    timespan=timespan,
+                )
+            except Exception as exc:  # pragma: no cover - network/IO failure guard
+                logging.error(
+                    "Failed to backfill contract window",
+                    extra={"ticker": ticker, "from": new_from_str, "to": new_to_str, "error": str(exc)},
+                )
+                continue
+
+    updated_keys = _list_option_keys()
+    updated_meta = _build_metadata(updated_keys)
+
+    if updated_meta.empty:
+        return cached_meta
+
+    return updated_meta
+
+
+def _load_or_fetch_contract_ohlcv(
     contract_ticker: str,
-    start_date: str,
-    end_date: str,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
     multiplier: int = 1,
     timespan: str = "day",
 ) -> pd.DataFrame:
-    """Fetch aggregated bars for an option contract and persist them."""
+    """Retrieve OHLCV aggregates for a single OCC contract.
+
+    Parameters
+    ----------
+    contract_ticker : str
+        OCC-formatted option contract ticker (e.g. ``"O:SPY250117C00470000"``).
+    start_ts : pandas.Timestamp
+        Inclusive lower bound for the aggregate time window.
+    end_ts : pandas.Timestamp
+        Inclusive upper bound for the aggregate time window.
+    multiplier : int, default=1
+        Multiplier for the Polygon aggregate query.
+    timespan : str, default="day"
+        Timespan string understood by Polygon (e.g. ``"day"`` or ``"minute"``).
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame indexed by timestamp ``t`` with open, high, low, close, and
+        volume columns. Empty when neither cache nor API returned data.
+    """
     timeframe = get_timeframe_str(multiplier, timespan)
     key = make_option_key(contract_ticker, timeframe)
+
+    price_columns = ["o", "h", "l", "c", "v"]
 
     df_cached = read_hdf(key)
     if not df_cached.empty:
         df_cached = df_cached.copy()
-        df_cached["date"] = pd.to_datetime(df_cached.get("date"), errors="coerce")
-        df_cached = df_cached.dropna(subset=["date"])
-        df_cached["date"] = df_cached["date"].dt.date
+        if "t" in df_cached.columns and not isinstance(df_cached.index, pd.DatetimeIndex):
+            df_cached.index = pd.to_datetime(df_cached.pop("t"), errors="coerce")
+        elif not isinstance(df_cached.index, pd.DatetimeIndex):
+            df_cached.index = pd.to_datetime(df_cached.index, errors="coerce")
+
+        df_cached = df_cached[~df_cached.index.isna()]
+        df_cached.index = df_cached.index.tz_localize(None)
+        df_cached.index.name = "t"
+        for col in price_columns:
+            if col not in df_cached.columns:
+                df_cached[col] = pd.NA
+        df_cached = df_cached[price_columns]
+
+        if not df_cached.empty:
+            min_cached = df_cached.index.min()
+            max_cached = df_cached.index.max()
+            if min_cached <= start_ts and max_cached >= end_ts:
+                return df_cached.loc[(df_cached.index >= start_ts) & (df_cached.index <= end_ts)]
     else:
-        df_cached = pd.DataFrame(columns=["timestamp", "date", "volume", "open_interest", "ticker"])
+        df_cached = pd.DataFrame(columns=price_columns)
 
-    start_ts = pd.to_datetime(start_date)
-    end_ts = pd.to_datetime(end_date)
-    if pd.isna(start_ts) or pd.isna(end_ts) or end_ts < start_ts:
-        logging.warning("Invalid date range for contract agg", extra={"contract": contract_ticker, "start": start_date, "end": end_date})
-        return pd.DataFrame()
-
-    if not df_cached.empty and not df_cached[df_cached.get("ticker") == contract_ticker].empty:
-        existing = df_cached[df_cached.get("ticker") == contract_ticker]
-        min_cached = existing["date"].min()
-        max_cached = existing["date"].max()
-        if min_cached <= start_ts.date() and max_cached >= end_ts.date():
-            return existing.reset_index(drop=True)
-
-    url = f"https://api.polygon.io/v2/aggs/ticker/{contract_ticker}/range/{multiplier}/{timespan}/{start_ts.date().isoformat()}/{end_ts.date().isoformat()}"
+    url = (
+        f"https://api.polygon.io/v2/aggs/ticker/{contract_ticker}/range/"
+        f"{multiplier}/{timespan}/{start_ts.date().isoformat()}/{end_ts.date().isoformat()}"
+    )
     params = {
         "adjusted": "true",
         "include_open_interest": "true",
@@ -204,52 +347,185 @@ def fetch_option_contract_agg(
             "Option contract aggregate request failed",
             extra={"contract": contract_ticker, "error": str(exc)},
         )
-        return pd.DataFrame()
+        return df_cached.loc[(df_cached.index >= start_ts) & (df_cached.index <= end_ts)]
 
     if resp.status_code != 200:
         logging.error(
             "Option contract aggregate HTTP error",
             extra={"contract": contract_ticker, "status": resp.status_code, "body": resp.text[:500]},
         )
-        return pd.DataFrame()
+        return df_cached.loc[(df_cached.index >= start_ts) & (df_cached.index <= end_ts)]
 
     payload = resp.json()
     results = payload.get("results", [])
-    if not results:
-        logging.info("No aggregate data returned for contract", extra={"contract": contract_ticker})
-        df_new = pd.DataFrame(columns=["timestamp", "date", "volume", "open_interest", "ticker"])
-    else:
+    if results:
         df_new = pd.DataFrame(results)
-        rename_map = {"t": "timestamp", "v": "volume", "oi": "open_interest"}
-        df_new = df_new.rename(columns=rename_map)
-        if "timestamp" in df_new.columns:
-            df_new["timestamp"] = pd.to_datetime(df_new["timestamp"], unit="ms", errors="coerce")
-            df_new["date"] = df_new["timestamp"].dt.date
-        for col in ["volume", "open_interest"]:
+        if "t" not in df_new.columns:
+            logging.error("Polygon agg response missing timestamp", extra={"contract": contract_ticker})
+            return df_cached.loc[(df_cached.index >= start_ts) & (df_cached.index <= end_ts)]
+
+        df_new["t"] = pd.to_datetime(df_new["t"], unit="ms", errors="coerce")
+        df_new = df_new.dropna(subset=["t"])
+        df_new["t"] = df_new["t"].dt.tz_localize(None)
+        df_new = df_new.set_index("t")
+        df_new.index.name = "t"
+
+        # Ensure the resulting frame contains the expected OHLCV schema.
+        for col in price_columns:
             if col not in df_new.columns:
                 df_new[col] = pd.NA
-        if "date" in df_new.columns:
-            df_new["date"] = pd.to_datetime(df_new["date"], errors="coerce").dt.date
-        df_new["ticker"] = contract_ticker
+        df_new = df_new[price_columns]
+
+        combined = pd.concat([df_cached, df_new])
+        combined = combined[~combined.index.duplicated(keep="last")]
+        combined = combined.sort_index()
+
+        try:
+            write_hdf(combined, key)
+            logging.info("Cached contract OHLCV", extra={"contract": contract_ticker, "key": key})
+        except Exception as exc:
+            logging.error("Failed to cache contract OHLCV", extra={"key": key, "error": str(exc)})
+
+        df_cached = combined
+
+    window = df_cached.loc[(df_cached.index >= start_ts) & (df_cached.index <= end_ts)]
+    return window
+
+
+@retry_request(max_retries=3)
+def fetch_option_contracts(
+    underlying: str,
+    exp_date_min: str,
+    exp_date_max: str,
+    strike_min: float,
+    strike_max: float,
+    limit: int = 1000,
+) -> list[str]:
+    """Return OCC tickers from Polygon within the expiration and strike window.
+
+    Parameters
+    ----------
+    underlying : str
+        Ticker symbol for the contract's underlying security.
+    exp_date_min : str
+        Inclusive ISO date string representing the minimum expiration.
+    exp_date_max : str
+        Inclusive ISO date string representing the maximum expiration.
+    strike_min : float
+        Minimum strike price (inclusive) to request from Polygon.
+    strike_max : float
+        Maximum strike price (inclusive) to request from Polygon.
+    limit : int, default=1000
+        Page size to request from the Polygon API.
+
+    Returns
+    -------
+    list of str
+        OCC contract tickers satisfying the supplied filters. The list is empty
+        if no contracts are returned.
+
+    Raises
+    ------
+    ValueError
+        Raised when expiration inputs or strike bounds are invalid.
+    """
 
     try:
-        combined = pd.concat([df_cached, df_new], ignore_index=True)
-        combined["date"] = pd.to_datetime(combined.get("date"), errors="coerce")
-        combined = combined.dropna(subset=["date"])
-        combined["date"] = combined["date"].dt.date
-        combined = combined.drop_duplicates(subset=["ticker", "date"], keep="last").reset_index(drop=True)
-        write_hdf(combined, key)
-        logging.info("Cached contract aggregates", extra={"symbol": symbol, "ticker": contract_ticker, "key": key})
-    except Exception as exc:
-        logging.error("Failed to cache contract aggregates", extra={"key": key, "error": str(exc)})
+        start_date = pd.to_datetime(exp_date_min).date()
+        end_date = pd.to_datetime(exp_date_max).date()
+    except (TypeError, ValueError) as exc:  # pragma: no cover - defensive guard
+        raise ValueError("Invalid ISO expiration date supplied to fetch_option_contracts") from exc
 
-    combined_contract = combined[combined.get("ticker") == contract_ticker].copy()
-    combined_contract["date"] = pd.to_datetime(combined_contract.get("date"), errors="coerce").dt.date
-    return combined_contract[(combined_contract["date"] >= start_ts.date()) & (combined_contract["date"] <= end_ts.date())].reset_index(drop=True)
+    if start_date > end_date:
+        raise ValueError("Parameter 'exp_date_min' must be on or before 'exp_date_max'")
+
+    strike_floor = float(strike_min)
+    strike_ceiling = float(strike_max)
+    if strike_floor > strike_ceiling:
+        raise ValueError("Parameter 'strike_min' must be <= 'strike_max'")
+
+    base_url = "https://api.polygon.io/v3/reference/options/contracts"
+    params: Dict[str, object] = {
+        "underlying_ticker": underlying.upper(),
+        "expiration_date.gte": start_date.isoformat(),
+        "expiration_date.lte": end_date.isoformat(),
+        "strike_price.gte": strike_floor,
+        "strike_price.lte": strike_ceiling,
+        "limit": limit,
+        "apiKey": SET.api_key,
+    }
+
+    tickers: list[str] = []
+    seen: set[str] = set()
+    url = base_url
+    first_page = True
+
+    while url:
+        # Walk Polygon's paginated endpoint, following ``next_url`` links when present.
+        logging.info(
+            "Fetching option contracts",
+            extra={
+                "underlying": underlying,
+                "from": start_date.isoformat(),
+                "to": end_date.isoformat(),
+                "url": url if first_page else "next_url",
+            },
+        )
+        try:
+            resp = requests.get(url, params=params if first_page else None)
+        except requests.exceptions.RequestException as exc:
+            logging.error("Option contracts request failed", extra={"underlying": underlying, "error": str(exc)})
+            break
+
+        if resp.status_code != 200:
+            logging.error(
+                "Option contracts HTTP error",
+                extra={"underlying": underlying, "status": resp.status_code, "body": resp.text[:500]},
+            )
+            break
+
+        payload = resp.json()
+        results = payload.get("results", [])
+        for result in results:
+            ticker = result.get("ticker")
+            if not ticker or ticker in seen:
+                continue
+            seen.add(ticker)
+            tickers.append(str(ticker))
+
+        next_url = payload.get("next_url")
+        if not next_url:
+            break
+
+        url = next_url
+        params = None
+        if "apiKey" not in url:
+            connector = "&" if "?" in url else "?"
+            url = f"{url}{connector}apiKey={SET.api_key}"
+        first_page = False
+
+    return tickers
 
 
 def _normalize_interval(interval: str | None) -> str:
-    """Return a canonical interval key used across the data layer."""
+    """Normalize interval strings to the canonical cache key representation.
+
+    Parameters
+    ----------
+    interval : str or None
+        Interval string supplied by the caller. ``None`` defaults to the value
+        configured in settings.
+
+    Returns
+    -------
+    str
+        Uppercase interval key understood by downstream helpers.
+
+    Raises
+    ------
+    ValueError
+        Raised when the interval is not in ``INTERVAL_CONFIG``.
+    """
     default_interval = (SET.default_interval or "1D").upper()
     interval_key = (interval or default_interval).upper()
     if interval_key not in INTERVAL_CONFIG:
@@ -258,11 +534,42 @@ def _normalize_interval(interval: str | None) -> str:
         )
     return interval_key
 
+
 def _interval_delta(interval_key: str) -> pd.Timedelta:
+    """Return the pandas ``Timedelta`` configured for the given interval.
+
+    Parameters
+    ----------
+    interval_key : str
+        Canonical interval key such as ``"1D"`` or ``"15M"``.
+
+    Returns
+    -------
+    pandas.Timedelta
+        Timedelta representing the spacing between adjacent bars.
+    """
     return INTERVAL_CONFIG[interval_key]["delta"]  # type: ignore[index]
 
+
 def _ensure_market_datetime(df: pd.DataFrame) -> pd.DataFrame:
-    """Standardize timestamp/date columns for market dataframes."""
+    """Standardize timestamp and date columns for market dataframes.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Raw market data that may contain ``Timestamp`` or ``Date`` columns.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Copy of ``df`` with normalized ``Timestamp`` and ``Date`` columns. An
+        empty frame is returned when the input is empty.
+
+    Raises
+    ------
+    ValueError
+        Raised when neither ``Timestamp`` nor ``Date`` columns are present.
+    """
     if df is None or df.empty:
         return pd.DataFrame()
     frame = df.copy()
@@ -280,8 +587,29 @@ def _ensure_market_datetime(df: pd.DataFrame) -> pd.DataFrame:
     frame = frame.drop_duplicates(subset="Timestamp").sort_values("Timestamp").reset_index(drop=True)
     return frame
 
+
 def _resolve_window(start: str | pd.Timestamp, end: str | pd.Timestamp, interval_key: str) -> tuple[pd.Timestamp, pd.Timestamp]:
-    """Normalize start/end bounds for a given interval."""
+    """Normalize start/end bounds for a given interval.
+
+    Parameters
+    ----------
+    start : str or pandas.Timestamp
+        Inclusive start boundary of the requested window.
+    end : str or pandas.Timestamp
+        Inclusive end boundary of the requested window.
+    interval_key : str
+        Canonical interval key used to adjust day-level boundaries.
+
+    Returns
+    -------
+    tuple of pandas.Timestamp
+        Normalized ``(start, end)`` timestamps free of timezone information.
+
+    Raises
+    ------
+    ValueError
+        Raised when ``start`` occurs after ``end``.
+    """
     start_ts = pd.to_datetime(start).tz_localize(None)
     end_ts = pd.to_datetime(end).tz_localize(None)
     if interval_key == "1D":
@@ -291,8 +619,26 @@ def _resolve_window(start: str | pd.Timestamp, end: str | pd.Timestamp, interval
         raise ValueError("start_date must be before end_date")
     return start_ts, end_ts
 
+
 def _filter_market_window(df: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp, interval_key: str) -> pd.DataFrame:
-    """Return the slice of market data between start/end for the provided interval."""
+    """Return the slice of market data between start/end for the provided interval.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Market data frame to filter.
+    start_ts : pandas.Timestamp
+        Inclusive lower bound.
+    end_ts : pandas.Timestamp
+        Inclusive upper bound.
+    interval_key : str
+        Interval key controlling whether comparisons use dates or timestamps.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Filtered frame containing only rows within the requested window.
+    """
     if df is None or df.empty:
         return pd.DataFrame()
     frame = _ensure_market_datetime(df)
@@ -303,17 +649,23 @@ def _filter_market_window(df: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.T
         mask = (frame["Timestamp"] >= start_ts) & (frame["Timestamp"] <= end_ts)
     return frame.loc[mask].reset_index(drop=True)
 
-def _filter_options_window(df: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> pd.DataFrame:
-    """Slice options sentiment data between the requested day bounds."""
-    if df is None or df.empty:
-        return pd.DataFrame()
-    frame = df.copy()
-    frame["Date"] = pd.to_datetime(frame["Date"]).dt.normalize()
-    mask = (frame["Date"] >= start_ts) & (frame["Date"] <= end_ts)
-    return frame.loc[mask].reset_index(drop=True)
 
 def _cache_market_bounds(df: pd.DataFrame, interval_key: str) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
-    """Return the minimum and maximum timestamp/date stored for market data."""
+    """Return the minimum and maximum timestamp/date stored for market data.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Cached market data frame.
+    interval_key : str
+        Interval key used to determine whether to inspect ``Timestamp`` or ``Date``.
+
+    Returns
+    -------
+    tuple of pandas.Timestamp or None
+        Tuple ``(min_timestamp, max_timestamp)`` or ``(None, None)`` when the
+        frame is empty.
+    """
     if df is None or df.empty:
         return None, None
     frame = _ensure_market_datetime(df)
@@ -321,13 +673,6 @@ def _cache_market_bounds(df: pd.DataFrame, interval_key: str) -> tuple[pd.Timest
         dates = pd.to_datetime(frame["Date"]).dt.normalize()
         return dates.min(), dates.max()
     return frame["Timestamp"].min(), frame["Timestamp"].max()
-
-def _cache_options_bounds(df: pd.DataFrame) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
-    """Return the min/max available dates for options sentiment cache."""
-    if df is None or df.empty:
-        return None, None
-    dates = pd.to_datetime(df["Date"]).dt.normalize()
-    return dates.min(), dates.max()
 
 
 @retry_request(max_retries=3)
@@ -405,168 +750,29 @@ def fetch_market_data(symbol: str, start: str, end: str, interval: str | None = 
         return pd.DataFrame()
 
 
-def _fetch_options_range(
-    symbol: str,
-    start: pd.Timestamp,
-    end: pd.Timestamp,
-    interval: str = "1D",
-    show_progress: bool = True,
-) -> pd.DataFrame:
-    """Fetch aggregated options sentiment for the provided inclusive date range."""
-    interval_key = _normalize_interval(interval)
-    if interval_key != "1D":
-        raise ValueError("Options sentiment currently supports only the 1D interval.")
-
-    start_ts, end_ts = _resolve_window(start, end, interval_key)
-    dates = pd.date_range(start_ts, end_ts, freq="D")
-    iterator = tqdm(dates, desc=f"Options data {symbol}", unit="day", leave=False, position=0) if show_progress else dates
-    agg_cache: Dict[str, pd.DataFrame] = {}
-
-    summary = []
-
-    for d in iterator:
-        as_of = d.strftime("%Y-%m-%d")
-        contracts_master = _load_or_fetch_contracts(symbol, as_of)
-        contracts_master = contracts_master.dropna(subset=["ticker"]).copy()
-        contracts_master["contract_type"] = contracts_master.get("contract_type", "").astype(str).str.upper()
-        contracts_master["strike_price"] = pd.to_numeric(contracts_master.get("strike_price"), errors="coerce")
-        contracts_master["expiration_date"] = pd.to_datetime(contracts_master.get("expiration_date"), errors="coerce")
-        contracts_in_range = contracts_master[
-            (contracts_master["expiration_date"] >= start_ts)
-            & (contracts_master["expiration_date"] <= end_ts)
-        ].dropna(subset=["expiration_date"]).reset_index(drop=True)
-        contracts_list = contracts_in_range.to_dict("records")
-        total_contracts = len(contracts_list)
-        row = {
-            "Date": as_of,
-            "CallVol": None,
-            "PutVol": None,
-            "CallOI": None,
-            "PutOI": None,
-            "PutCallVolRatio": None,
-            "PutCallOIRatio": None,
-            "SentimentIndex": None,
-            "CallContractCount": 0,
-            "PutContractCount": 0,
-            "AvgCallStrike": None,
-            "AvgPutStrike": None,
-            "EarliestExpiration": None,
-            "LatestExpiration": None,
-        }
-
-        if total_contracts == 0:
-            logging.info("No contracts in expiration window", extra={"symbol": symbol})
-            summary.append(row)
-            continue
-
-        row["EarliestExpiration"] = contracts_in_range["expiration_date"].min()
-        row["LatestExpiration"] = contracts_in_range["expiration_date"].max()
-
-        total_call_vol = total_put_vol = 0.0
-        total_call_oi = total_put_oi = 0.0
-        call_count = put_count = 0
-        call_strikes: List[float] = []
-        put_strikes: List[float] = []
-
-        for idx, contract in enumerate(contracts_list, start=1):
-            ticker = contract.get("ticker")
-            if not ticker or pd.isna(ticker):
-                continue
-            contract_type = str(contract.get("contract_type") or "").upper()
-            strike_price = pd.to_numeric(contract.get("strike_price"), errors="coerce")
-
-            if show_progress and total_contracts:
-                iterator.set_postfix_str(f"{as_of} {idx}/{total_contracts} {ticker}")
-
-            agg_df = agg_cache.get(ticker)
-            if agg_df is None:
-                agg_df = fetch_option_contract_agg(
-                    symbol=symbol,
-                    contract_ticker=ticker,
-                    start_date=start_ts.date().isoformat(),
-                    end_date=end_ts.date().isoformat(),
-                )
-                if "date" in agg_df.columns:
-                    agg_df["date"] = pd.to_datetime(agg_df["date"], errors="coerce").dt.date
-                agg_cache[ticker] = agg_df
-
-            daily_rows = pd.DataFrame()
-            if not agg_df.empty and "date" in agg_df.columns:
-                daily_rows = agg_df[agg_df["date"] == d.date()]
-
-            volume = pd.to_numeric(daily_rows.get("volume"), errors="coerce").fillna(0.0).sum() if "volume" in daily_rows.columns else 0.0
-            open_interest = pd.to_numeric(daily_rows.get("open_interest"), errors="coerce").fillna(0.0).sum() if "open_interest" in daily_rows.columns else 0.0
-
-            if contract_type == "CALL":
-                call_count += 1
-                if pd.notna(strike_price):
-                    call_strikes.append(float(strike_price))
-                total_call_vol += volume
-                total_call_oi += open_interest
-            elif contract_type == "PUT":
-                put_count += 1
-                if pd.notna(strike_price):
-                    put_strikes.append(float(strike_price))
-                total_put_vol += volume
-                total_put_oi += open_interest
-
-        if show_progress and total_contracts:
-            iterator.set_postfix_str("")
-
-        total_vol = total_call_vol + total_put_vol
-
-        row.update({
-            "CallVol": total_call_vol if total_call_vol else None,
-            "PutVol": total_put_vol if total_put_vol else None,
-            "CallOI": total_call_oi if total_call_oi else None,
-            "PutOI": total_put_oi if total_put_oi else None,
-            "PutCallVolRatio": (total_put_vol / total_call_vol) if total_call_vol else None,
-            "PutCallOIRatio": (total_put_oi / total_call_oi) if total_call_oi else None,
-            "SentimentIndex": ((total_call_vol - total_put_vol) / total_vol) if total_vol else None,
-            "CallContractCount": call_count,
-            "PutContractCount": put_count,
-            "AvgCallStrike": (sum(call_strikes) / len(call_strikes)) if call_strikes else None,
-            "AvgPutStrike": (sum(put_strikes) / len(put_strikes)) if put_strikes else None,
-        })
-
-        if row["EarliestExpiration"] is not None:
-            row["EarliestExpiration"] = pd.to_datetime(row["EarliestExpiration"]).date().isoformat()
-        if row["LatestExpiration"] is not None:
-            row["LatestExpiration"] = pd.to_datetime(row["LatestExpiration"]).date().isoformat()
-
-        if row["EarliestExpiration"] is not None:
-            row["EarliestExpiration"] = pd.to_datetime(row["EarliestExpiration"]).date().isoformat()
-        if row["LatestExpiration"] is not None:
-            row["LatestExpiration"] = pd.to_datetime(row["LatestExpiration"]).date().isoformat()
-
-        summary.append(row)
-
-    df = pd.DataFrame(summary)
-    if df.empty:
-        return df
-    df["Date"] = pd.to_datetime(df["Date"]).dt.normalize()
-    if "EarliestExpiration" in df.columns:
-        df["EarliestExpiration"] = pd.to_datetime(df["EarliestExpiration"], errors="coerce").dt.strftime("%Y-%m-%d")
-    if "LatestExpiration" in df.columns:
-        df["LatestExpiration"] = pd.to_datetime(df["LatestExpiration"], errors="coerce").dt.strftime("%Y-%m-%d")
-    return df.sort_values("Date").reset_index(drop=True)
-
 def get_market_data(symbol: str, start: str, end: str, interval: str | None = None, use_cache: bool = True) -> pd.DataFrame:
-    """
-    Retrieve market data for a symbol, optionally using cached values.
+    """Retrieve market data for a symbol, optionally using cached values.
 
     Parameters
     ----------
     symbol : str
-        Ticker symbol.
+        Underlying ticker to query.
     start : str
-        Start timestamp in ISO format.
+        Inclusive ISO timestamp (or date) marking the beginning of the window.
     end : str
-        End timestamp in ISO format.
+        Inclusive ISO timestamp (or date) marking the end of the window.
     interval : str, optional
-        Interval key (1M, 5M, 15M, 1H, 4H, 1D). Defaults to settings default.
-    use_cache : bool
-        Whether to read/write cache.
+        Interval key (``"1M"``, ``"5M"``, ``"1D"``, etc.). ``None`` falls back to
+        the default interval in settings.
+    use_cache : bool, default=True
+        When ``True`` the function will attempt to reuse and extend locally
+        cached data.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Windowed OHLCV data satisfying the request. An empty frame is returned
+        if data cannot be retrieved.
     """
     try:
         interval_key = _normalize_interval(interval)
@@ -576,13 +782,15 @@ def get_market_data(symbol: str, start: str, end: str, interval: str | None = No
 
     start_ts, end_ts = _resolve_window(start, end, interval_key)
 
-    cached_full = load_cache("market", symbol, interval=interval_key) if use_cache else pd.DataFrame()
+    market_key = make_stock_key(symbol, interval_key)
+    cached_full = read_hdf(market_key) if use_cache else pd.DataFrame()
     if not cached_full.empty:
         cached_min, cached_max = _cache_market_bounds(cached_full, interval_key)
         if cached_min is not None and cached_max is not None:
             if start_ts >= cached_min and end_ts <= cached_max:
                 return _filter_market_window(cached_full, start_ts, end_ts, interval_key)
 
+    # Cache miss or partial coverage—request the missing portion directly from Polygon.
     df = fetch_market_data(
         symbol,
         start_ts.strftime("%Y-%m-%d") if interval_key == "1D" else start_ts.isoformat(),
@@ -595,8 +803,9 @@ def get_market_data(symbol: str, start: str, end: str, interval: str | None = No
 
     combined = pd.concat([cached_full, df], ignore_index=True) if not cached_full.empty else df
     combined = _ensure_market_datetime(combined)
-    save_cache(combined, "market", symbol, interval=interval_key)
+    write_hdf(combined, market_key)
     return _filter_market_window(combined, start_ts, end_ts, interval_key)
+
 
 def get_options_data(
     symbol: str,
@@ -604,222 +813,143 @@ def get_options_data(
     end_date: str,
     interval: str | None = None,
     use_cache: bool = True,
+    look_forward: int = 7,
+    strike_bounds: float = 0.05,
 ) -> pd.DataFrame:
-    """
-    Fetches daily aggregated options sentiment data (volume, OI ratios) for a given symbol.
-    Uses Polygon's /v2/aggs/ticker endpoint to retrieve historical ranges.
+    """Return OCC contract metadata for the requested window.
 
     Parameters
     ----------
     symbol : str
-        Underlying symbol (e.g. 'SPY')
+        Underlying ticker used to locate both market data and option contracts.
     start_date : str
-        Start date (YYYY-MM-DD)
+        Inclusive ISO date representing the beginning of the analysis window.
     end_date : str
-        End date (YYYY-MM-DD)
+        Inclusive ISO date representing the end of the analysis window.
     interval : str, optional
-        Supported interval keys (currently only 1D).
-    use_cache : bool
-        Whether to read/write from local cache
+        Interval key passed through to market-data helpers. ``None`` defaults to
+        the configured interval.
+    use_cache : bool, default=True
+        When ``True`` both the market data lookup and contract loader will
+        consult cached data before calling external services.
+    look_forward : int, default=7
+        Number of interval units to project forward when choosing option
+        expirations. Helps ensure contracts expiring shortly after the window
+        remain available downstream.
+    strike_bounds : float, default=0.05
+        Buffer applied to the observed OHLC price range, widening the minimum
+        and maximum strike thresholds by the supplied percentage.
 
     Returns
     -------
     pandas.DataFrame
-        Daily sentiment summary (Call/Put ratios, OI metrics)
+        DataFrame of OCC contract metadata meeting the derived filters. Empty
+        when no contracts are located or prerequisites fail.
     """
+
     try:
         interval_key = _normalize_interval(interval)
     except ValueError as exc:
         logging.error(str(exc))
         return pd.DataFrame()
 
-    if interval_key != "1D":
-        logging.error("Options data currently supports only the 1D interval.")
+    if strike_bounds < 0:
+        logging.error(
+            "strike_bounds must be non-negative",
+            extra={"symbol": symbol, "strike_bounds": strike_bounds},
+        )
+        return pd.DataFrame()
+
+    market_df = get_market_data(symbol, start_date, end_date, interval=interval_key, use_cache=use_cache)
+    if market_df.empty:
+        logging.warning(
+            "Unable to compute strike bounds due to missing market data",
+            extra={"symbol": symbol, "start": start_date, "end": end_date},
+        )
+        return pd.DataFrame()
+
+    # Remove raw volume columns—only price levels contribute to strike bounds.
+    drop_cols = [col for col in ("v", "Volume") if col in market_df.columns]
+    if drop_cols:
+        market_df = market_df.drop(columns=drop_cols)
+
+    # Accept typical OHLC naming variants produced by different data sources.
+    price_columns = [
+        col
+        for col in ("Open", "High", "Low", "Close", "open", "high", "low", "close", "o", "h", "l", "c")
+        if col in market_df.columns
+    ]
+    if not price_columns:
+        logging.error(
+            "Market data lacks OHLC columns required for strike bounds",
+            extra={"symbol": symbol, "columns": list(market_df.columns)},
+        )
+        return pd.DataFrame()
+
+    prices = market_df[price_columns].apply(pd.to_numeric, errors="coerce")
+    strike_min_val = prices.min().min()
+    strike_max_val = prices.max().max()
+
+    if pd.isna(strike_min_val) or pd.isna(strike_max_val):
+        logging.warning(
+            "Failed to derive strike bounds from market data",
+            extra={"symbol": symbol, "start": start_date, "end": end_date},
+        )
+        return pd.DataFrame()
+
+    strike_min = float(max(0.0, strike_min_val * (1 - strike_bounds)))
+    strike_max = float(strike_max_val * (1 + strike_bounds))
+
+    if strike_min > strike_max:
+        logging.warning(
+            "Computed strike bounds are invalid",
+            extra={
+                "symbol": symbol,
+                "strike_min": strike_min,
+                "strike_max": strike_max,
+                "strike_bounds": strike_bounds,
+            },
+        )
         return pd.DataFrame()
 
     start_ts, end_ts = _resolve_window(start_date, end_date, interval_key)
+    step = _interval_delta(interval_key)
+    forward_multiplier = max(0, look_forward)
+    forward_delta = step * forward_multiplier
 
-    cached_full = load_cache("options", symbol, interval=interval_key) if use_cache else pd.DataFrame()
-    if not cached_full.empty:
-        cached_min, cached_max = _cache_options_bounds(cached_full)
-        if cached_min is not None and cached_max is not None:
-            if start_ts >= cached_min and end_ts <= cached_max:
-                return _filter_options_window(cached_full, start_ts, end_ts)
+    from_ts = start_ts + forward_delta
+    to_ts = end_ts + forward_delta
 
-    df = _fetch_options_range(
-        symbol,
-        start_ts,
-        end_ts,
-        interval=interval_key,
-        show_progress=True,
-    )
-    if df.empty:
-        logging.info(f"Fetched 0 days of options sentiment for {symbol}")
-        return df
+    from_str = from_ts.date().isoformat()
+    to_str = to_ts.date().isoformat()
 
-    combined_full = pd.concat([cached_full, df], ignore_index=True) if not cached_full.empty else df
-    combined_full = combined_full.copy()
-    combined_full["Date"] = pd.to_datetime(combined_full["Date"]).dt.normalize()
-    combined_full = combined_full.drop_duplicates(subset="Date").sort_values("Date").reset_index(drop=True)
-
-    window = _filter_options_window(combined_full, start_ts, end_ts)
-    if window.empty:
-        logging.info(f"Fetched 0 days of options sentiment for {symbol}")
-        return window
-
-    save_cache(combined_full, "options", symbol, interval=interval_key)
-    logging.info(f"Fetched {len(window)} days of options sentiment for {symbol}")
-    return window
-
-def load_or_fetch_market(
-    symbol: str,
-    start_date: str,
-    end_date: str,
-    interval: str | None = None,
-    force_refresh: bool = False,
-) -> pd.DataFrame:
-    """
-    Load cached market data for the requested window, fetching and backfilling gaps as needed.
-
-    Data are stored under `data/csv/market/<interval>/<symbol>.csv`. Only missing segments
-    are retrieved from Polygon to minimize API usage.
-    """
     try:
-        interval_key = _normalize_interval(interval)
-    except ValueError as exc:
-        logging.error(str(exc))
-        return pd.DataFrame()
-
-    requested_start, requested_end = _resolve_window(start_date, end_date, interval_key)
-
-    cached = load_cache("market", symbol, interval=interval_key) if not force_refresh else pd.DataFrame()
-    if not cached.empty:
-        cached = _ensure_market_datetime(cached)
-
-    cached_min, cached_max = _cache_market_bounds(cached, interval_key)
-
-    if (
-        not force_refresh
-        and cached_min is not None
-        and cached_max is not None
-        and requested_start >= cached_min
-        and requested_end <= cached_max
-    ):
-        return _filter_market_window(cached, requested_start, requested_end, interval_key)
-
-    missing_ranges: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
-    if force_refresh or cached.empty or cached_min is None or cached_max is None:
-        missing_ranges = [(requested_start, requested_end)]
-    else:
-        step = _interval_delta(interval_key)
-        if requested_start < cached_min:
-            fetch_end = min(requested_end, cached_min - step)
-            if fetch_end >= requested_start:
-                missing_ranges.append((requested_start, fetch_end))
-        if requested_end > cached_max:
-            fetch_start = max(requested_start, cached_max + step)
-            if requested_end >= fetch_start:
-                missing_ranges.append((fetch_start, requested_end))
-
-        range_iterator = tqdm(missing_ranges, desc=f"{symbol}: market gaps", unit="range", leave=False, position=0) if missing_ranges else missing_ranges
-    for range_start, range_end in range_iterator:
-        if range_start > range_end:
-            continue
-        start_str = range_start.strftime("%Y-%m-%d") if interval_key == "1D" else range_start.isoformat()
-        end_str = range_end.strftime("%Y-%m-%d") if interval_key == "1D" else range_end.isoformat()
-        logging.info(
-            "Fetching market data via Polygon",
-            extra={"symbol": symbol, "interval": interval_key, "from": start_str, "to": end_str},
+        # Use the derived window and strike filters to retrieve cached contracts,
+        # backfilling the HDF store when required.
+        contracts_df = _load_or_fetch_contracts(
+            symbol=symbol,
+            timeframe=interval_key,
+            from_=from_str,
+            to=to_str,
+            strike_min=strike_min,
+            strike_max=strike_max,
         )
-        chunk = fetch_market_data(symbol, start_str, end_str, interval=interval_key)
-        if chunk.empty:
-            continue
-        fetched = _ensure_market_datetime(chunk)
-        cached = pd.concat([cached, fetched], ignore_index=True) if not cached.empty else fetched
-        cached = _ensure_market_datetime(cached)
-        save_cache(cached, "market", symbol, interval=interval_key)
-
-    if force_refresh and cached.empty:
-        save_cache(cached, "market", symbol, interval=interval_key)
-
-    if cached.empty:
-        return cached
-
-    return _filter_market_window(cached, requested_start, requested_end, interval_key)
-
-def load_or_fetch_options(
-    symbol: str,
-    start_date: str,
-    end_date: str,
-    interval: str | None = None,
-    force_refresh: bool = False,
-) -> pd.DataFrame:
-    """
-    Load cached options sentiment if present, otherwise fetch from Polygon and persist to
-    `data/csv/options/<interval>/<symbol>.csv`. Only the 1D interval is currently supported.
-    """
-    try:
-        interval_key = _normalize_interval(interval)
     except ValueError as exc:
-        logging.error(str(exc))
-        return pd.DataFrame()
-
-    if interval_key != "1D":
-        logging.error("Options data currently supports only the 1D interval.")
-        return pd.DataFrame()
-
-    requested_start, requested_end = _resolve_window(start_date, end_date, interval_key)
-
-    cached = load_cache("options", symbol, interval=interval_key) if not force_refresh else pd.DataFrame()
-    if not cached.empty:
-        cached = cached.copy()
-        cached["Date"] = pd.to_datetime(cached["Date"]).dt.normalize()
-        cached = cached.drop_duplicates(subset="Date").sort_values("Date").reset_index(drop=True)
-
-    cached_min, cached_max = _cache_options_bounds(cached)
-
-    if (
-        not force_refresh
-        and cached_min is not None
-        and cached_max is not None
-        and requested_start >= cached_min
-        and requested_end <= cached_max
-    ):
-        return _filter_options_window(cached, requested_start, requested_end)
-
-    missing_ranges: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
-    if force_refresh or cached.empty or cached_min is None or cached_max is None:
-        missing_ranges = [(requested_start, requested_end)]
-    else:
-        step = pd.Timedelta(days=1)
-        if requested_start < cached_min:
-            fetch_end = min(requested_end, cached_min - step)
-            if fetch_end >= requested_start:
-                missing_ranges.append((requested_start, fetch_end))
-        if requested_end > cached_max:
-            fetch_start = max(requested_start, cached_max + step)
-            if requested_end >= fetch_start:
-                missing_ranges.append((fetch_start, requested_end))
-
-    range_iterator = tqdm(missing_ranges, desc=f"{symbol}: option gaps", unit="range", leave=False, position=0) if missing_ranges else missing_ranges
-    for range_start, range_end in range_iterator:
-        logging.info(
-            "Fetching options data via Polygon",
-            extra={"symbol": symbol, "from": range_start.strftime("%Y-%m-%d"), "to": range_end.strftime("%Y-%m-%d")},
+        logging.error(
+            "Failed to load option contracts",
+            extra={"symbol": symbol, "from": from_str, "to": to_str, "error": str(exc)},
         )
-        chunk = _fetch_options_range(symbol, range_start, range_end, interval=interval_key, show_progress=True)
-        if chunk.empty:
-            continue
-        fetched = chunk.copy()
-        fetched["Date"] = pd.to_datetime(fetched["Date"]).dt.normalize()
-        cached = pd.concat([cached, fetched], ignore_index=True) if not cached.empty else fetched
-        cached = cached.drop_duplicates(subset="Date").sort_values("Date").reset_index(drop=True)
-        save_cache(cached, "options", symbol, interval=interval_key)
+        return pd.DataFrame()
 
-    if force_refresh and cached.empty:
-        save_cache(cached, "options", symbol, interval=interval_key)
+    if contracts_df.empty:
+        logging.info(
+            "No option contracts returned",
+            extra={
+                "symbol": symbol,
+                "from": from_str,
+                "to": to_str,
+                "look_forward": forward_multiplier,
+            },
+        )
 
-    if cached.empty:
-        return cached
-
-    return _filter_options_window(cached, requested_start, requested_end)
+    return contracts_df
