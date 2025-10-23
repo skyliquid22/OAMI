@@ -13,11 +13,11 @@ Stocks and features keep a simpler pattern:
     /features/{symbol}/{timeframe}
 """
 
-import re
 import logging
-from datetime import datetime
+import re
+from datetime import datetime, date
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Tuple
 
 import pandas as pd
 
@@ -118,6 +118,10 @@ def make_option_contract_key(ticker: str, timeframe: str) -> str:
     return f"{bucket}/{_sanitize(ticker)}"
 
 
+def make_option_coverage_key(symbol: str, timeframe: str) -> str:
+    return f"/coverage/options/{_sanitize(symbol)}/{_sanitize(timeframe)}"
+
+
 def make_stock_key(symbol: str, timeframe: str) -> str:
     """Build key for stock OHLCV data."""
     return f"/stocks/{_sanitize(symbol)}/{_sanitize(timeframe)}"
@@ -172,3 +176,33 @@ def read_hdf(key: str) -> pd.DataFrame:
             if fallback != key and fallback in store:
                 store.remove(fallback)
         return pd.DataFrame()
+
+
+def read_option_coverage(symbol: str, timeframe: str) -> Tuple[date | None, date | None]:
+    key = make_option_coverage_key(symbol, timeframe)
+    if not H5_PATH.exists():
+        return None, None
+    with pd.HDFStore(H5_PATH, mode="r") as store:
+        if key not in store:
+            return None, None
+        df = store.select(key)
+    if df.empty:
+        return None, None
+    start = pd.to_datetime(df.iloc[-1]["start"], errors="coerce")
+    end = pd.to_datetime(df.iloc[-1]["end"], errors="coerce")
+    start_date = start.date() if not pd.isna(start) else None
+    end_date = end.date() if not pd.isna(end) else None
+    return start_date, end_date
+
+
+def update_option_coverage(symbol: str, timeframe: str, start: date, end: date) -> None:
+    key = make_option_coverage_key(symbol, timeframe)
+    existing_start, existing_end = read_option_coverage(symbol, timeframe)
+    if existing_start is not None:
+        start = min(start, existing_start)
+    if existing_end is not None:
+        end = max(end, existing_end)
+    df = pd.DataFrame({"start": [start.isoformat()], "end": [end.isoformat()]})
+    H5_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with pd.HDFStore(H5_PATH, mode="a") as store:
+        store.put(key, df, format="table")

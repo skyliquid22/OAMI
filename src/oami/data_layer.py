@@ -1,8 +1,7 @@
-import re, logging, pandas as pd, requests
+import re, logging, pandas as pd, requests, sys
 from datetime import datetime, timedelta, date
 from typing import Dict, List, Tuple
 from time import perf_counter
-from tqdm import tqdm  # type: ignore
 from polygon import RESTClient
 
 from oami.utils.decorators import retry_request
@@ -15,6 +14,8 @@ from oami.utils.cache_manager import (
     make_option_contract_key,
     get_timeframe_str,
     make_stock_key,
+    read_option_coverage,
+    update_option_coverage,
 )
 
 from .config import Settings
@@ -91,17 +92,6 @@ def _load_or_fetch_contracts(
     timeframe_normalized = cache_manager._sanitize(interval_key)
     underlying = cache_manager._sanitize(symbol.upper())
 
-    end_year_raw = f"{end_date.year:04d}"
-    try:
-        end_month_raw = cache_manager.MONTHS[end_date.month - 1]
-    except IndexError as exc:  # pragma: no cover - defensive guard
-        raise ValueError("Invalid month extracted from 'to' parameter") from exc
-
-    end_year = cache_manager._sanitize(end_year_raw)
-    end_month = cache_manager._sanitize(end_month_raw)
-
-    base_prefix = f"/options/{end_year}/{end_month}/{underlying}/{timeframe_normalized}"
-
     if bucket_cache is None:
         bucket_cache = {}
     if bucket_removals is None:
@@ -113,27 +103,51 @@ def _load_or_fetch_contracts(
 
     meta_columns = [
         "ticker",
-        "underlying",
-        "contract_type",
-        "strike_price",
-        "date",
         "expiration_date",
+        "strike_price",
+        "contract_type",
     ]
 
     ticker_pattern = re.compile(r"O:([A-Z]{1,6})(\d{2})(\d{2})(\d{2})([CP])(\d{8})")
 
+    def _month_prefixes() -> list[str]:
+        """Construct sanitized cache prefixes for each month in [start, end]."""
+        prefixes: list[str] = []
+        current_year = start_date.year
+        current_month = start_date.month
+        while (current_year, current_month) <= (end_date.year, end_date.month):
+            try:
+                month_token = cache_manager.MONTHS[current_month - 1]
+            except IndexError as exc:  # pragma: no cover - defensive guard
+                raise ValueError("Invalid month generated for cache prefix") from exc
+            year_part = cache_manager._sanitize(f"{current_year:04d}")
+            month_part = cache_manager._sanitize(month_token)
+            prefixes.append(f"/options/{year_part}/{month_part}/{underlying}/{timeframe_normalized}")
+            if current_month == 12:
+                current_year += 1
+                current_month = 1
+            else:
+                current_month += 1
+        return prefixes
+
     def _list_option_keys() -> list[str]:
-        """List cached HDF keys for the derived prefix."""
+        """List cached HDF keys for the derived monthly prefixes."""
         if not cache_manager.H5_PATH.exists():
             return []
-        legacy_prefix = cache_manager._desanitize_key(base_prefix)
+        prefixes = _month_prefixes()
+        if not prefixes:
+            return []
+        legacy_map = {prefix: cache_manager._desanitize_key(prefix) for prefix in prefixes}
+        prefix_candidates = prefixes + [
+            legacy for prefix, legacy in legacy_map.items() if legacy != prefix
+        ]
         with pd.HDFStore(cache_manager.H5_PATH, mode="r") as store:
             keys: list[str] = []
             for key in store.keys():
-                if key == base_prefix or key.startswith(f"{base_prefix}/"):
-                    keys.append(key)
-                elif legacy_prefix != base_prefix and (key == legacy_prefix or key.startswith(f"{legacy_prefix}/")):
-                    keys.append(key)
+                for candidate in prefix_candidates:
+                    if key == candidate or key.startswith(f"{candidate}/"):
+                        keys.append(key)
+                        break
             return cache_manager._unique(keys)
 
     def _unsanitize_ticker(token: str) -> str:
@@ -149,13 +163,15 @@ def _load_or_fetch_contracts(
 
         for key in keys:
             df_bucket = read_hdf(key)
-            if df_bucket.empty:
+            if not isinstance(df_bucket, pd.DataFrame) or df_bucket.empty:
                 legacy_key = cache_manager._desanitize_key(key)
                 if legacy_key != key:
                     df_bucket = read_hdf(legacy_key)
+            if not isinstance(df_bucket, pd.DataFrame) or df_bucket.empty:
+                continue
 
             tickers: set[str] = set()
-            if not df_bucket.empty and "ticker" in df_bucket.columns:
+            if isinstance(df_bucket, pd.DataFrame) and not df_bucket.empty and "ticker" in df_bucket.columns:
                 tickers.update(
                     pd.Series(df_bucket["ticker"], dtype="string").dropna().astype(str).unique().tolist()
                 )
@@ -183,7 +199,8 @@ def _load_or_fetch_contracts(
                 if not (strike_floor <= strike_price <= strike_ceiling):
                     continue
 
-                contract_type = match.group(5)
+                contract_type_token = match.group(5)
+                contract_type = "call" if contract_type_token.upper() == "C" else "put"
                 month_name = occ_meta["month"]
                 try:
                     month_index = cache_manager.MONTHS.index(month_name) + 1
@@ -191,18 +208,17 @@ def _load_or_fetch_contracts(
                     logging.warning("Unknown month in OCC metadata", extra={"month": month_name, "ticker": ticker})
                     continue
 
-                expiration = date(occ_meta["year"], month_index, occ_meta["day"])
-                if expiration < start_date or expiration > end_date:
+                expiration = pd.Timestamp(year=occ_meta["year"], month=month_index, day=occ_meta["day"])
+                expiration_date = expiration.date()
+                if expiration_date < start_date or expiration_date > end_date:
                     continue
 
                 records.append(
                     {
                         "ticker": ticker,
-                        "underlying": occ_meta["underlying"],
-                        "contract_type": "CALL" if contract_type == "C" else "PUT",
-                        "strike_price": strike_price,
-                        "date": expiration,
                         "expiration_date": expiration,
+                        "strike_price": strike_price,
+                        "contract_type": contract_type,
                     }
                 )
 
@@ -211,114 +227,112 @@ def _load_or_fetch_contracts(
 
         frame = pd.DataFrame(records)
         frame = frame.drop_duplicates(subset="ticker", keep="last")
-        frame = frame.sort_values(["date", "ticker"]).reset_index(drop=True)
-        return frame
-
-    def _compute_missing_dates(meta_df: pd.DataFrame) -> list[date]:
-        """Determine which expiry dates are absent from the cached metadata."""
-        requested_dates = [d.date() for d in pd.date_range(start_date, end_date, freq="D")]
-        if meta_df.empty:
-            return requested_dates
-        available_dates = set(meta_df["date"].tolist())
-        return [d for d in requested_dates if d not in available_dates]
+        if "expiration_date" in frame.columns:
+            frame = frame.sort_values(["expiration_date", "ticker"]).reset_index(drop=True)
+        for column in meta_columns:
+            if column not in frame.columns:
+                frame[column] = pd.NA
+        return frame.reset_index(drop=True)[meta_columns]
 
     option_keys = _list_option_keys()
     cached_meta = _build_metadata(option_keys)
 
-    if not cached_meta.empty:
-        min_cached = cached_meta["date"].min()
-        max_cached = cached_meta["date"].max()
-    else:
-        min_cached = max_cached = None
+    coverage_start, coverage_end = read_option_coverage(symbol.upper(), timeframe)
+    if cached_meta.empty:
+        coverage_start = coverage_end = None
+    request_start_date = pd.to_datetime(from_).date()
+    request_end_date = pd.to_datetime(to).date()
 
-    missing_dates = _compute_missing_dates(cached_meta)
-    if (
-        not missing_dates
-        and min_cached is not None
-        and max_cached is not None
-        and min_cached <= start_date
-        and max_cached >= end_date
-    ):
-        return cached_meta, bucket_cache, bucket_removals
-
-    missing_dates.sort()
     missing_ranges: list[tuple[date, date]] = []
-    if missing_dates:
-        range_start = missing_dates[0]
-        range_end = missing_dates[0]
-        for current in missing_dates[1:]:
-            if current == range_end + timedelta(days=1):
-                range_end = current
-            else:
-                missing_ranges.append((range_start, range_end))
-                range_start = range_end = current
-        missing_ranges.append((range_start, range_end))
+    if coverage_start is None or coverage_end is None:
+        missing_ranges.append((request_start_date, request_end_date))
+    else:
+        if request_start_date < coverage_start:
+            missing_start = request_start_date
+            missing_end = min(request_end_date, coverage_start - timedelta(days=1))
+            if missing_start <= missing_end:
+                missing_ranges.append((missing_start, missing_end))
+        if request_end_date > coverage_end:
+            missing_start = max(request_start_date, coverage_end + timedelta(days=1))
+            if missing_start <= request_end_date:
+                missing_ranges.append((missing_start, request_end_date))
 
-    multiplier = int(interval_cfg["multiplier"])  # type: ignore[call-overload]
-    timespan = str(interval_cfg["timespan"])  # type: ignore[call-overload]
+    if missing_ranges:
+        multiplier = int(interval_cfg["multiplier"])  # type: ignore[call-overload]
+        timespan = str(interval_cfg["timespan"])  # type: ignore[call-overload]
 
-    range_iter = _progress(missing_ranges, desc=f"Backfill ranges {symbol}", total=len(missing_ranges), leave=False)
-    for range_start, range_end in range_iter:
-        new_from_str = range_start.isoformat()
-        new_to_str = range_end.isoformat()
-        logging.info(
-            "Backfilling option contracts",
-            extra={
-                "symbol": symbol,
-                "from": new_from_str,
-                "to": new_to_str,
-                "timeframe": timeframe_normalized,
-            },
-        )
+        for range_start, range_end in _progress_iter(
+            missing_ranges, desc=f"Backfill ranges {symbol}", total=len(missing_ranges)
+        ):
+            new_from_str = range_start.isoformat()
+            new_to_str = range_end.isoformat()
+            logging.info(
+                "Backfilling option contracts",
+                extra={
+                    "symbol": symbol,
+                    "from": new_from_str,
+                    "to": new_to_str,
+                    "timeframe": timeframe_normalized,
+                },
+            )
 
-        fetch_timer = perf_counter()
-        tickers = fetch_option_contracts(
-            underlying=underlying,
-            exp_date_min=new_from_str,
-            exp_date_max=new_to_str,
-            strike_min=strike_floor,
-            strike_max=strike_ceiling,
-        )
-        logging.info(
-            "fetch_option_contracts duration",
-            extra={
-                "symbol": symbol,
-                "from": new_from_str,
-                "to": new_to_str,
-                "seconds": round(perf_counter() - fetch_timer, 3),
-                "tickers": len(tickers),
-            },
-        )
-        range_iter.set_postfix_str(f"tickers={len(tickers)}")
-        if not tickers:
-            continue
-
-        from_pd = pd.Timestamp(new_from_str).tz_localize(None)
-        to_pd = pd.Timestamp(new_to_str).tz_localize(None)
-
-        contract_iter = _progress(list(map(str, tickers)), desc=f"Option OHLCV {symbol}", total=len(tickers), leave=False)
-        for ticker in contract_iter:
-            try:
-                # Ensure OHLCV history exists for the contract and date range; the
-                # helper manages persistence once data is downloaded from Polygon.
-                _load_or_fetch_contract_ohlcv(
-                    ticker,
-                    multiplier=multiplier,
-                    timespan=timespan,
-                    window_override=(from_pd, to_pd),
-                    bucket_cache=bucket_cache,
-                    bucket_removals=bucket_removals,
-                )
-            except Exception as exc:  # pragma: no cover - network/IO failure guard
-                logging.error(
-                    "Failed to backfill contract window",
-                    extra={"ticker": ticker, "from": new_from_str, "to": new_to_str, "error": str(exc)},
-                )
+            fetch_timer = perf_counter()
+            tickers = fetch_option_contracts(
+                underlying=underlying,
+                exp_date_min=new_from_str,
+                exp_date_max=new_to_str,
+                strike_min=strike_floor,
+                strike_max=strike_ceiling,
+            )
+            logging.info(
+                "fetch_option_contracts duration",
+                extra={
+                    "symbol": symbol,
+                    "from": new_from_str,
+                    "to": new_to_str,
+                    "seconds": round(perf_counter() - fetch_timer, 3),
+                    "tickers": len(tickers),
+                },
+            )
+            if not tickers:
                 continue
-            contract_iter.set_postfix_str(ticker)
+
+            from_pd = pd.Timestamp(new_from_str).tz_localize(None)
+            to_pd = pd.Timestamp(new_to_str).tz_localize(None)
+
+            for ticker in _progress_iter(list(map(str, tickers)), desc=f"Option OHLCV {symbol}", total=len(tickers)):
+                try:
+                    _load_or_fetch_contract_ohlcv(
+                        ticker,
+                        multiplier=multiplier,
+                        timespan=timespan,
+                        window_override=(from_pd, to_pd),
+                        bucket_cache=bucket_cache,
+                        bucket_removals=bucket_removals,
+                    )
+                except Exception as exc:  # pragma: no cover - network/IO failure guard
+                    logging.error(
+                        "Failed to backfill contract window",
+                        extra={"ticker": ticker, "from": new_from_str, "to": new_to_str, "error": str(exc)},
+                    )
+                    continue
+    else:
+        logging.info(
+            "Options coverage hit",
+            extra={
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "from": request_start_date.isoformat(),
+                "to": request_end_date.isoformat(),
+            },
+        )
 
     updated_keys = _list_option_keys()
     updated_meta = _build_metadata(updated_keys)
+
+    new_cov_start = min(request_start_date, coverage_start) if coverage_start is not None else request_start_date
+    new_cov_end = max(request_end_date, coverage_end) if coverage_end is not None else request_end_date
+    update_option_coverage(symbol.upper(), timeframe, new_cov_start, new_cov_end)
 
     if updated_meta.empty:
         return cached_meta, bucket_cache, bucket_removals
@@ -359,48 +373,24 @@ def _load_or_fetch_contract_ohlcv(
 
         expiration = pd.Timestamp(year=occ_info["year"], month=month_index, day=occ_info["day"]).tz_localize(None)
 
-        timespan_lower = timespan.lower()
-        if timespan_lower.startswith("day"):
-            span = pd.Timedelta(days=1)
-        elif timespan_lower.startswith("hour"):
-            span = pd.Timedelta(hours=1)
-        elif timespan_lower.startswith("minute"):
-            span = pd.Timedelta(minutes=1)
-        else:
-            span = pd.Timedelta(days=1)
-
-        start_ts = expiration - span * int(multiplier) * 90
+        span = _timespan_delta(timespan, multiplier)
+        start_ts = expiration - span
         end_ts = expiration
 
     start_ts = pd.Timestamp(start_ts).tz_localize(None)
     end_ts = pd.Timestamp(end_ts).tz_localize(None)
 
-    def _normalize_bucket(df: pd.DataFrame) -> pd.DataFrame:
-        if df is None or df.empty:
-            return pd.DataFrame(columns=["ticker", "t", *price_columns])
-        tmp = df.copy()
-        if "t" not in tmp.columns:
-            if isinstance(tmp.index, pd.DatetimeIndex):
-                tmp = tmp.reset_index().rename(columns={tmp.index.name or "index": "t"})
-            else:
-                tmp["t"] = pd.to_datetime(tmp.get("t"), errors="coerce")
-        tmp["t"] = pd.to_datetime(tmp["t"], errors="coerce").dt.tz_localize(None)
-        if "ticker" not in tmp.columns:
-            tmp["ticker"] = contract_ticker
-        for col in price_columns:
-            if col not in tmp.columns:
-                tmp[col] = pd.NA
-        tmp = tmp.dropna(subset=["t", "ticker"])
-        tmp = tmp.sort_values(["ticker", "t"]).drop_duplicates(subset=["ticker", "t"], keep="last").reset_index(drop=True)
-        return tmp[["ticker", "t", *price_columns]]
-
     if bucket_key in bucket_cache:
         df_bucket = bucket_cache[bucket_key]
     else:
         df_bucket = read_hdf(bucket_key)
-        if df_bucket.empty and legacy_bucket_key != bucket_key:
-            df_bucket = read_hdf(legacy_bucket_key)
-        df_bucket = _normalize_bucket(df_bucket)
+        if not isinstance(df_bucket, pd.DataFrame) or df_bucket.empty:
+            legacy_bucket = cache_manager._desanitize_key(bucket_key)
+            if legacy_bucket != bucket_key:
+                df_bucket = read_hdf(legacy_bucket)
+        if not isinstance(df_bucket, pd.DataFrame) or df_bucket.empty:
+            df_bucket = pd.DataFrame(columns=["ticker", "t", *price_columns])
+        df_bucket = _normalize_bucket_frame(df_bucket, default_ticker=None)
         bucket_cache[bucket_key] = df_bucket
 
     subset = bucket_cache[bucket_key][bucket_cache[bucket_key]["ticker"] == contract_ticker]
@@ -456,11 +446,11 @@ def _load_or_fetch_contract_ohlcv(
         df_new["ticker"] = contract_ticker
         df_new = df_new[["ticker", "t", *price_columns]]
 
-        if bucket_cache[bucket_key].empty:
-            combined = df_new.copy()
+        existing = bucket_cache.get(bucket_key)
+        if not isinstance(existing, pd.DataFrame) or existing.empty:
+            combined = _normalize_bucket_frame(df_new)
         else:
-            combined = pd.concat([bucket_cache[bucket_key], df_new], ignore_index=True)
-        combined = _normalize_bucket(combined)
+            combined = _normalize_bucket_frame(pd.concat([existing, df_new], ignore_index=True))
         bucket_cache[bucket_key] = combined
         bucket_removals.setdefault(bucket_key, set()).add(contract_key)
 
@@ -626,6 +616,42 @@ def _interval_delta(interval_key: str) -> pd.Timedelta:
         Timedelta representing the spacing between adjacent bars.
     """
     return INTERVAL_CONFIG[interval_key]["delta"]  # type: ignore[index]
+
+
+def _timespan_delta(timespan: str, multiplier: int) -> pd.Timedelta:
+    base = timespan.lower()
+    if base.startswith("day"):
+        unit = pd.Timedelta(days=1)
+    elif base.startswith("hour"):
+        unit = pd.Timedelta(hours=1)
+    elif base.startswith("minute"):
+        unit = pd.Timedelta(minutes=1)
+    else:
+        unit = pd.Timedelta(days=1)
+    return unit * int(multiplier) * 90
+
+
+def _normalize_bucket_frame(df: pd.DataFrame, default_ticker: str | None = None) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["ticker", "t", "o", "h", "l", "c", "v"])
+    tmp = df.copy()
+    if "t" not in tmp.columns:
+        if isinstance(tmp.index, pd.DatetimeIndex):
+            tmp = tmp.reset_index().rename(columns={tmp.index.name or "index": "t"})
+        else:
+            tmp["t"] = pd.to_datetime(tmp.get("t"), errors="coerce")
+    tmp["t"] = pd.to_datetime(tmp["t"], errors="coerce").dt.tz_localize(None)
+    if "ticker" not in tmp.columns:
+        if default_ticker is not None:
+            tmp["ticker"] = default_ticker
+        else:
+            raise ValueError("Bucket frame missing ticker column")
+    for col in ["o", "h", "l", "c", "v"]:
+        if col not in tmp.columns:
+            tmp[col] = pd.NA
+    tmp = tmp.dropna(subset=["t", "ticker"])
+    tmp = tmp.sort_values(["ticker", "t"]).drop_duplicates(subset=["ticker", "t"], keep="last").reset_index(drop=True)
+    return tmp[["ticker", "t", "o", "h", "l", "c", "v"]]
 
 
 def _ensure_market_datetime(df: pd.DataFrame) -> pd.DataFrame:
@@ -808,27 +834,30 @@ def get_market_data(symbol: str, start: str, end: str, interval: str | None = No
     start_ts, end_ts = _resolve_window(start, end, interval_key)
 
     market_key = make_stock_key(symbol, interval_key)
-    cached_full = read_hdf(market_key) if use_cache else pd.DataFrame()
-    if not cached_full.empty:
+    cached_full = read_hdf(market_key) if use_cache else None
+    if isinstance(cached_full, pd.DataFrame) and not cached_full.empty:
         cached_min, cached_max = _cache_market_bounds(cached_full, interval_key)
         if cached_min is not None and cached_max is not None:
             if start_ts >= cached_min and end_ts <= cached_max:
                 return _filter_market_window(cached_full, start_ts, end_ts, interval_key)
 
     # Cache miss or partial coverage—request the missing portion directly from Polygon.
-    with _progress([0], desc=f"Market data {symbol}", leave=False) as progress:
-        df = fetch_market_data(
-            symbol,
-            start_ts.strftime("%Y-%m-%d") if interval_key == "1D" else start_ts.isoformat(),
-            end_ts.strftime("%Y-%m-%d") if interval_key == "1D" else end_ts.isoformat(),
-            interval=interval_key,
-        )
-        progress.update(1)
+    print(f"Fetching market data {symbol}...", end="\r")
+    df = fetch_market_data(
+        symbol,
+        start_ts.strftime("%Y-%m-%d") if interval_key == "1D" else start_ts.isoformat(),
+        end_ts.strftime("%Y-%m-%d") if interval_key == "1D" else end_ts.isoformat(),
+        interval=interval_key,
+    )
+    print(f"Fetching market data {symbol}...done")
     if df.empty:
         logging.warning(f"No market data retrieved for {symbol}", extra={"interval": interval_key})
         return pd.DataFrame()
 
-    combined = pd.concat([cached_full, df], ignore_index=True) if not cached_full.empty else df
+    if isinstance(cached_full, pd.DataFrame) and not cached_full.empty:
+        combined = pd.concat([cached_full, df], ignore_index=True)
+    else:
+        combined = df
     combined = _ensure_market_datetime(combined)
     write_hdf(combined, market_key)
     window = _filter_market_window(combined, start_ts, end_ts, interval_key)
@@ -842,6 +871,7 @@ def get_options_data(
     interval: str | None = None,
     use_cache: bool = True,
     look_forward: int = 30,
+    look_backward: int = 30,
     strike_bounds: float = 0.05,
 ) -> pd.DataFrame:
     """Return OCC contract metadata for the requested window.
@@ -864,6 +894,10 @@ def get_options_data(
         Number of interval units to project forward when choosing option
         expirations. Helps ensure contracts expiring shortly after the window
         remain available downstream.
+    look_backward : int, default=30
+        Number of interval units to project backward from ``start_date`` when
+        deriving contract filters. Ensures contracts expiring shortly before
+        the window stay available for feature engineering.
     strike_bounds : float, default=0.05
         Buffer applied to the observed OHLC price range, widening the minimum
         and maximum strike thresholds by the supplied percentage.
@@ -871,8 +905,9 @@ def get_options_data(
     Returns
     -------
     pandas.DataFrame
-        DataFrame of OCC contract metadata meeting the derived filters. Empty
-        when no contracts are located or prerequisites fail.
+        DataFrame indexed by OCC ticker with columns ``expiration_date``,
+        ``strike_price``, ``contract_type``, and ``ohlcv`` (per-contract OHLCV
+        DataFrame). Empty when no contracts are located or prerequisites fail.
     """
 
     try:
@@ -887,6 +922,8 @@ def get_options_data(
             extra={"symbol": symbol, "strike_bounds": strike_bounds},
         )
         return pd.DataFrame()
+
+    result_columns = ["expiration_date", "strike_price", "contract_type", "ohlcv"]
 
     market_timer = perf_counter()
     market_df = get_market_data(symbol, start_date, end_date, interval=interval_key, use_cache=use_cache)
@@ -952,8 +989,10 @@ def get_options_data(
     step = _interval_delta(interval_key)
     forward_multiplier = max(0, look_forward)
     forward_delta = step * forward_multiplier
+    backward_multiplier = max(0, look_backward)
+    backward_delta = step * backward_multiplier
 
-    from_ts = start_ts
+    from_ts = start_ts - backward_delta
     to_ts = end_ts + forward_delta
 
     from_str = from_ts.date().isoformat()
@@ -1003,84 +1042,110 @@ def get_options_data(
             },
         )
         _persist_option_buckets(bucket_cache, bucket_removals)
-        return contracts_df
+        return pd.DataFrame(columns=result_columns)
 
     multiplier = int(INTERVAL_CONFIG[interval_key]["multiplier"])  # type: ignore[call-overload]
     timespan = str(INTERVAL_CONFIG[interval_key]["timespan"])  # type: ignore[call-overload]
 
-    enriched_rows: list[pd.Series] = []
-    records = contracts_df.to_dict("records")
-    total_contracts = len(records)
-    progress_iter = _progress(records, desc=f"Option OHLCV {symbol}", total=total_contracts, leave=False)
-    enrich_total = 0.0
-    for idx, record in enumerate(progress_iter, start=1):
-        row = pd.Series(record)
-        ticker = row.get("ticker")
-        if not isinstance(ticker, str):
-            progress_iter.set_postfix_str(f"{idx}/{total_contracts}")
-            continue
-
-        single_start = perf_counter()
+    grouped: dict[str, list[str]] = {}
+    for ticker in contracts_df["ticker"].astype(str):
         try:
-            ohlcv_df = _load_or_fetch_contract_ohlcv(
-                contract_ticker=ticker,
-                multiplier=multiplier,
-                timespan=timespan,
-                bucket_cache=bucket_cache,
-                bucket_removals=bucket_removals,
-            )
-        except Exception as exc:  # pragma: no cover - defensive guard
-            logging.error(
-                "Failed to load contract OHLCV",
-                extra={"ticker": ticker, "from": from_str, "to": to_str, "error": str(exc)},
-            )
-            progress_iter.set_postfix_str(f"{idx}/{total_contracts}")
+            info = parse_occ_ticker(ticker)
+        except ValueError:
             continue
+        bucket = make_option_key(ticker, timeframe=interval_key)
+        grouped.setdefault(bucket, []).append(ticker)
 
-        enrich_total += perf_counter() - single_start
+    ohlcv_map: dict[str, pd.DataFrame] = {}
+    enrich_total = 0.0
 
-        enriched = row.copy()
-        enriched["ohlcv"] = ohlcv_df
-        enriched_rows.append(enriched)
-        progress_iter.set_postfix_str(f"{idx}/{total_contracts}")
+    for bucket_key, tickers_in_bucket in grouped.items():
+        legacy_bucket_key = cache_manager._desanitize_key(bucket_key)
+        if bucket_key in bucket_cache:
+            df_bucket = bucket_cache[bucket_key]
+        else:
+            df_bucket = read_hdf(bucket_key)
+            if not isinstance(df_bucket, pd.DataFrame) or df_bucket.empty:
+                if legacy_bucket_key != bucket_key:
+                    df_bucket = read_hdf(legacy_bucket_key)
+        df_bucket = _normalize_bucket_frame(df_bucket)
+        bucket_cache[bucket_key] = df_bucket
 
-    if not enriched_rows:
+        for ticker in _progress_iter(tickers_in_bucket, desc=f"Option OHLCV {symbol} {bucket_key}", total=len(tickers_in_bucket)):
+            subset = df_bucket[df_bucket["ticker"] == ticker]
+            if subset.empty:
+                single_start = perf_counter()
+                from_pd = pd.Timestamp(from_str).tz_localize(None)
+                to_pd = pd.Timestamp(to_str).tz_localize(None)
+                ohlcv_df = _load_or_fetch_contract_ohlcv(
+                    contract_ticker=ticker,
+                    multiplier=multiplier,
+                    timespan=timespan,
+                    window_override=(from_pd, to_pd),
+                    bucket_cache=bucket_cache,
+                    bucket_removals=bucket_removals,
+                )
+                enrich_total += perf_counter() - single_start
+                df_bucket = bucket_cache[bucket_key]
+                subset = df_bucket[df_bucket["ticker"] == ticker]
+            else:
+                ohlcv_df = subset.set_index("t")[["o", "h", "l", "c", "v"]].sort_index()
+            ohlcv_map[ticker] = ohlcv_df
+
+    if not ohlcv_map:
         logging.warning(
             "No contract OHLCV data available after enrichment",
             extra={"symbol": symbol, "from": from_str, "to": to_str},
         )
         _persist_option_buckets(bucket_cache, bucket_removals)
-        return pd.DataFrame()
+        return pd.DataFrame(columns=result_columns)
 
     logging.info(
         "_load_or_fetch_contract_ohlcv total duration",
         extra={
             "symbol": symbol,
-            "contracts": len(enriched_rows),
+            "contracts": len(ohlcv_map),
             "seconds": round(enrich_total, 3),
         },
     )
 
     _persist_option_buckets(bucket_cache, bucket_removals)
 
-    result = pd.DataFrame(enriched_rows)
-    drop_cols = ["underlying", "contract_type", "strike_price", "date", "expiration_date"]
-    if not result.empty:
-        result = result.drop(columns=drop_cols, errors="ignore")
+    ohlcv_series = pd.Series(ohlcv_map, name="ohlcv")
+    metadata = contracts_df.set_index("ticker")
+    for meta_col in ("expiration_date", "strike_price", "contract_type"):
+        if meta_col not in metadata.columns:
+            metadata[meta_col] = pd.NA
+    desired_meta = metadata.reindex(ohlcv_series.index)[["expiration_date", "strike_price", "contract_type"]]
+    result = desired_meta.copy()
+    result["ohlcv"] = ohlcv_series
+    result.index.name = "ticker"
     return result
 
 
-def _progress(iterable, *, desc: str, total: int | None = None, leave: bool = False):
-    """Return a tqdm iterator configured for console/Jupyter friendly output."""
-    return tqdm(
-        iterable,
-        desc=desc,
-        total=total,
-        leave=leave,
-        dynamic_ncols=True,
-        miniters=1,
-        ascii=True,
-    )
+def _progress_iter(iterable, *, desc: str, total: int | None = None):
+    items = list(iterable)
+    total = total if total is not None else len(items)
+    start = perf_counter()
+    if total == 0:
+        sys.stdout.write(f"{desc}: 0/0 [0.00s]\n")
+        sys.stdout.flush()
+        return
+
+    for idx, item in enumerate(items, start=1):
+        if total:
+            pct = 100.0 * idx / total
+            sys.stdout.write(f"\r{desc}: {idx}/{total} ({pct:5.1f}%)")
+        else:
+            sys.stdout.write(f"\r{desc}: {idx}")
+        sys.stdout.flush()
+        yield item
+    elapsed = perf_counter() - start
+    if total:
+        sys.stdout.write(f"\r{desc}: {total}/{total} (100.0%) [{elapsed:.2f}s]\n")
+    else:
+        sys.stdout.write(f"\r{desc}: {idx} [{elapsed:.2f}s]\n")
+    sys.stdout.flush()
 
 
 def _persist_option_buckets(
