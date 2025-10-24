@@ -1,8 +1,10 @@
 import os
+import logging
 import sys
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
 if str(SRC_ROOT) not in sys.path:
@@ -106,3 +108,117 @@ def test_get_options_data_structured_output(monkeypatch):
     assert result.loc[ticker, "contract_type"] == "call"
     assert result.loc[ticker, "strike_price"] == 50.0
     assert isinstance(result.loc[ticker, "ohlcv"], pd.DataFrame)
+
+
+def test_load_or_fetch_contracts_skips_coverage_on_empty(monkeypatch, tmp_path):
+    monkeypatch.setattr(data_layer.cache_manager, "H5_PATH", tmp_path / "missing_store.h5")
+    monkeypatch.setattr(data_layer, "read_hdf", lambda key: pd.DataFrame())
+    monkeypatch.setattr(data_layer, "fetch_option_contracts", lambda **kwargs: [])
+    monkeypatch.setattr(data_layer, "read_option_coverage", lambda symbol, timeframe: (None, None))
+
+    calls: list[tuple] = []
+
+    def fake_update(symbol, timeframe, start, end):
+        calls.append((symbol, timeframe, start, end))
+
+    monkeypatch.setattr(data_layer, "update_option_coverage", fake_update)
+
+    meta, cache, removals = data_layer._load_or_fetch_contracts(
+        symbol="SPY",
+        timeframe="1D",
+        from_="2025-08-24",
+        to="2025-09-22",
+        strike_min=600.0,
+        strike_max=650.0,
+        bucket_cache={},
+        bucket_removals={},
+    )
+
+    assert meta.empty
+    assert calls == []
+
+
+def test_polygon_flatfile_client_logs_and_returns(monkeypatch, caplog):
+    class Result:
+        stdout = "                           PRE global_crypto/\n                           PRE global_forex/\n"
+
+    captured_cmd = {}
+
+    def fake_run(cmd, check, capture_output, text):
+        captured_cmd["cmd"] = cmd
+        return Result()
+
+    monkeypatch.setattr(data_layer.subprocess, "run", fake_run)
+
+    client = data_layer.PolygonFlatfileClient()
+    with caplog.at_level(logging.INFO):
+        output = client.list_root_directories()
+
+    assert captured_cmd["cmd"][:4] == ["aws", "s3", "ls", "s3://flatfiles/"]
+    assert output == ["global_crypto/", "global_forex/"]
+    assert any("global_crypto" in message for message in caplog.messages)
+
+
+def test_polygon_flatfile_client_download_single_file(monkeypatch, tmp_path, caplog):
+    class Result:
+        stdout = "downloaded"
+        stderr = ""
+
+    captured_cmd = {}
+
+    def fake_run(cmd, check, capture_output, text):
+        captured_cmd["cmd"] = cmd
+        return Result()
+
+    monkeypatch.setattr(data_layer.subprocess, "run", fake_run)
+    monkeypatch.chdir(tmp_path)
+
+    client = data_layer.PolygonFlatfileClient()
+    with caplog.at_level(logging.INFO):
+        dest = client.download_flatfile("stocks", "trades_v1", 2024, 3, 7)
+
+    expected_cmd = [
+        "aws",
+        "s3",
+        "cp",
+        "s3://flatfiles/us_stocks_sip/trades_v1/2024/03/2024-03-07.csv.gz",
+        str(tmp_path / "data/flatfiles/us_stocks_sip/trades_v1/2024/03/2024-03-07.csv.gz"),
+        "--endpoint-url",
+        "https://files.polygon.io",
+    ]
+    assert captured_cmd["cmd"] == expected_cmd
+    assert dest == tmp_path / "data/flatfiles/us_stocks_sip/trades_v1/2024/03/2024-03-07.csv.gz"
+    assert dest.parent.exists()
+    assert any("download complete" in message for message in caplog.messages)
+
+
+def test_polygon_flatfile_client_download_directory(monkeypatch, tmp_path):
+    class Result:
+        stdout = "completed"
+        stderr = ""
+
+    captured_cmd = {}
+
+    def fake_run(cmd, check, capture_output, text):
+        captured_cmd["cmd"] = cmd
+        return Result()
+
+    monkeypatch.setattr(data_layer.subprocess, "run", fake_run)
+    monkeypatch.chdir(tmp_path)
+
+    client = data_layer.PolygonFlatfileClient()
+    dest = client.download_flatfile("options", "trades_v1", 2023, 12)
+
+    expected_cmd = [
+        "aws",
+        "s3",
+        "cp",
+        "s3://flatfiles/us_options_opra/trades_v1/2023/12/",
+        str(tmp_path / "data/flatfiles/us_options_opra/trades_v1/2023/12"),
+        "--endpoint-url",
+        "https://files.polygon.io",
+        "--recursive",
+    ]
+    assert captured_cmd["cmd"] == expected_cmd
+    assert dest == tmp_path / "data/flatfiles/us_options_opra/trades_v1/2023/12"
+    assert dest.exists()

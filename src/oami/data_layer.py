@@ -3,6 +3,8 @@ from datetime import datetime, timedelta, date
 from typing import Dict, List, Tuple
 from time import perf_counter
 from polygon import RESTClient
+import subprocess
+from pathlib import Path
 
 from oami.utils.decorators import retry_request
 from oami.utils import cache_manager
@@ -132,8 +134,6 @@ def _load_or_fetch_contracts(
 
     def _list_option_keys() -> list[str]:
         """List cached HDF keys for the derived monthly prefixes."""
-        if not cache_manager.H5_PATH.exists():
-            return []
         prefixes = _month_prefixes()
         if not prefixes:
             return []
@@ -141,14 +141,23 @@ def _load_or_fetch_contracts(
         prefix_candidates = prefixes + [
             legacy for prefix, legacy in legacy_map.items() if legacy != prefix
         ]
-        with pd.HDFStore(cache_manager.H5_PATH, mode="r") as store:
-            keys: list[str] = []
-            for key in store.keys():
-                for candidate in prefix_candidates:
-                    if key == candidate or key.startswith(f"{candidate}/"):
-                        keys.append(key)
-                        break
-            return cache_manager._unique(keys)
+
+        keys: list[str] = []
+        if cache_manager.H5_PATH.exists():
+            with pd.HDFStore(cache_manager.H5_PATH, mode="r") as store:
+                for key in store.keys():
+                    for candidate in prefix_candidates:
+                        if key == candidate or key.startswith(f"{candidate}/"):
+                            keys.append(key)
+                            break
+
+        if bucket_cache:
+            for candidate in prefix_candidates:
+                for mem_key in bucket_cache.keys():
+                    if mem_key == candidate or mem_key.startswith(f"{candidate}/"):
+                        keys.append(mem_key)
+
+        return cache_manager._unique(keys)
 
     def _unsanitize_ticker(token: str) -> str:
         """Rehydrate an OCC ticker from the sanitized cache token."""
@@ -162,11 +171,17 @@ def _load_or_fetch_contracts(
         seen: set[str] = set()
 
         for key in keys:
-            df_bucket = read_hdf(key)
+            if bucket_cache and key in bucket_cache:
+                df_bucket = bucket_cache[key]
+            else:
+                df_bucket = read_hdf(key)
             if not isinstance(df_bucket, pd.DataFrame) or df_bucket.empty:
                 legacy_key = cache_manager._desanitize_key(key)
                 if legacy_key != key:
-                    df_bucket = read_hdf(legacy_key)
+                    if bucket_cache and legacy_key in bucket_cache:
+                        df_bucket = bucket_cache[legacy_key]
+                    else:
+                        df_bucket = read_hdf(legacy_key)
             if not isinstance(df_bucket, pd.DataFrame) or df_bucket.empty:
                 continue
 
@@ -330,12 +345,18 @@ def _load_or_fetch_contracts(
     updated_keys = _list_option_keys()
     updated_meta = _build_metadata(updated_keys)
 
-    new_cov_start = min(request_start_date, coverage_start) if coverage_start is not None else request_start_date
-    new_cov_end = max(request_end_date, coverage_end) if coverage_end is not None else request_end_date
-    update_option_coverage(symbol.upper(), timeframe, new_cov_start, new_cov_end)
-
     if updated_meta.empty:
         return cached_meta, bucket_cache, bucket_removals
+
+    exp_dates = pd.to_datetime(updated_meta["expiration_date"], errors="coerce").dropna()
+    if not exp_dates.empty:
+        cov_start = exp_dates.min().date()
+        cov_end = exp_dates.max().date()
+        if coverage_start is not None:
+            cov_start = min(cov_start, coverage_start)
+        if coverage_end is not None:
+            cov_end = max(cov_end, coverage_end)
+        update_option_coverage(symbol.upper(), timeframe, cov_start, cov_end)
 
     return updated_meta, bucket_cache, bucket_removals
 
@@ -514,6 +535,7 @@ def fetch_option_contracts(
     base_url = "https://api.polygon.io/v3/reference/options/contracts"
     params: Dict[str, object] = {
         "underlying_ticker": underlying.upper(),
+        "as_of": start_date.isoformat(),
         "expiration_date.gte": start_date.isoformat(),
         "expiration_date.lte": end_date.isoformat(),
         "strike_price.gte": strike_floor,
@@ -925,8 +947,27 @@ def get_options_data(
 
     result_columns = ["expiration_date", "strike_price", "contract_type", "ohlcv"]
 
+    start_ts, end_ts = _resolve_window(start_date, end_date, interval_key)
+    step = _interval_delta(interval_key)
+    forward_multiplier = max(0, look_forward)
+    backward_multiplier = max(0, look_backward)
+    forward_delta = step * forward_multiplier
+    backward_delta = step * backward_multiplier
+
+    market_start_ts = start_ts - backward_delta
+    market_end_ts = end_ts + forward_delta
+
+    def _format_market_input(ts: pd.Timestamp) -> str:
+        return ts.date().isoformat() if interval_key == "1D" else ts.isoformat()
+
     market_timer = perf_counter()
-    market_df = get_market_data(symbol, start_date, end_date, interval=interval_key, use_cache=use_cache)
+    market_df = get_market_data(
+        symbol,
+        _format_market_input(market_start_ts),
+        _format_market_input(market_end_ts),
+        interval=interval_key,
+        use_cache=use_cache,
+    )
     logging.info(
         "get_market_data duration",
         extra={
@@ -984,13 +1025,6 @@ def get_options_data(
             },
         )
         return pd.DataFrame()
-
-    start_ts, end_ts = _resolve_window(start_date, end_date, interval_key)
-    step = _interval_delta(interval_key)
-    forward_multiplier = max(0, look_forward)
-    forward_delta = step * forward_multiplier
-    backward_multiplier = max(0, look_backward)
-    backward_delta = step * backward_multiplier
 
     from_ts = start_ts - backward_delta
     to_ts = end_ts + forward_delta
@@ -1164,3 +1198,113 @@ def _persist_option_buckets(
             )
         except Exception as exc:
             logging.error("Failed to persist option bucket", extra={"key": key, "error": str(exc)})
+
+
+class PolygonFlatfileClient:
+    """Simple client for Polygon flat files stored on S3-compatible storage."""
+
+    def __init__(self) -> None:
+        self._logger = logging.getLogger(__name__)
+
+    def list_root_directories(self) -> list[str]:
+        """Return the directories present at the Polygon flatfiles root."""
+
+        try:
+            completed = subprocess.run(
+                [
+                    "aws",
+                    "s3",
+                    "ls",
+                    "s3://flatfiles/",
+                    "--endpoint-url",
+                    "https://files.polygon.io",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("AWS CLI is not installed or not available in PATH") from exc
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(f"AWS CLI command failed: {exc.stderr.strip()}") from exc
+
+        directories: list[str] = []
+        for line in completed.stdout.splitlines():
+            entry = line.strip()
+            if entry.endswith("/"):
+                directories.append(entry.split()[-1])
+        self._logger.info("Polygon flatfiles root entries: %s", directories)
+        return directories
+
+    def download_flatfile(
+        self,
+        data_type: str,
+        timeframe: str,
+        year: int,
+        month: int,
+        day: int | None = None,
+    ) -> Path:
+        """Download flatfile data to ``data/flatfiles`` for the requested path."""
+
+        type_map = {
+            "stocks": "us_stocks_sip",
+            "options": "us_options_opra",
+        }
+        try:
+            root_dir = type_map[data_type.lower()]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported data_type '{data_type}'. Expected one of {list(type_map)}") from exc
+
+        year_str = f"{int(year):04d}"
+        month_str = f"{int(month):02d}"
+        base_s3 = f"s3://flatfiles/{root_dir}/{timeframe}/{year_str}/{month_str}"
+        local_root_path = Path("data/flatfiles") / root_dir / timeframe / year_str / month_str
+        local_root_path.mkdir(parents=True, exist_ok=True)
+        local_root = local_root_path.resolve()
+
+        if day is not None:
+            day_str = f"{int(day):02d}"
+            filename = f"{year_str}-{month_str}-{day_str}.csv.gz"
+            source = f"{base_s3}/{filename}"
+            destination = local_root / filename
+            cmd = [
+                "aws",
+                "s3",
+                "cp",
+                source,
+                str(destination),
+                "--endpoint-url",
+                "https://files.polygon.io",
+            ]
+        else:
+            source = f"{base_s3}/"
+            destination = local_root
+            cmd = [
+                "aws",
+                "s3",
+                "cp",
+                source,
+                str(destination),
+                "--endpoint-url",
+                "https://files.polygon.io",
+                "--recursive",
+            ]
+
+        try:
+            completed = subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("AWS CLI is not installed or not available in PATH") from exc
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(f"AWS CLI command failed: {exc.stderr.strip()}") from exc
+
+        self._logger.info("Polygon flatfiles download complete: %s", cmd)
+        if completed.stdout.strip():
+            self._logger.debug("AWS CLI output:\n%s", completed.stdout.strip())
+        if completed.stderr.strip():
+            self._logger.warning("AWS CLI stderr:\n%s", completed.stderr.strip())
+        return destination
