@@ -231,8 +231,19 @@ def test_polygon_flatfile_client_download_single_file(monkeypatch, tmp_path, cap
 
 
 def test_polygon_flatfile_client_download_directory(monkeypatch, tmp_path):
-    class Result:
-        stdout = "completed"
+    class ConfigureResult:
+        stdout = ""
+        stderr = ""
+
+    class ListResult:
+        stdout = (
+            "2023-12-01 00:00:00          0 2023-12-01.csv.gz\n"
+            "2023-12-02 00:00:00          0 2023-12-02.csv.gz\n"
+        )
+        stderr = ""
+
+    class CopyResult:
+        stdout = "downloaded"
         stderr = ""
 
     commands = []
@@ -240,8 +251,10 @@ def test_polygon_flatfile_client_download_directory(monkeypatch, tmp_path):
     def fake_run(cmd, check, capture_output, text):
         commands.append(cmd)
         if len(cmd) >= 3 and cmd[1] == "configure":
-            return Result()
-        return Result()
+            return ConfigureResult()
+        if cmd[:3] == ["aws", "s3", "ls"]:
+            return ListResult()
+        return CopyResult()
 
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIA_TEST")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "SECRET_TEST")
@@ -255,11 +268,10 @@ def test_polygon_flatfile_client_download_directory(monkeypatch, tmp_path):
         "aws",
         "s3",
         "cp",
-        "s3://flatfiles/us_options_opra/day_aggs_v1/2023/12/",
-        str(tmp_path / "data/flatfiles/us_options_opra/day_aggs_v1/2023/12"),
+        "s3://flatfiles/us_options_opra/day_aggs_v1/2023/12/2023-12-02.csv.gz",
+        str(tmp_path / "data/flatfiles/us_options_opra/day_aggs_v1/2023/12/2023-12-02.csv.gz"),
         "--endpoint-url",
         "https://files.polygon.io",
-        "--recursive",
     ]
     assert commands[-1] == expected_cmd
     assert dest == tmp_path / "data/flatfiles/us_options_opra/day_aggs_v1/2023/12"
@@ -313,6 +325,7 @@ def test_get_option_flatfile_data_missing_file(tmp_path):
     result = data_layer.get_option_flatfile_data(
         underlying_ticker="XYZ",
         as_of="2024-03-07",
+        as_to="2024-03-07",
         base_dir=base,
     )
     assert result.empty
@@ -354,6 +367,7 @@ def test_get_option_flatfile_data_triggers_download(tmp_path, monkeypatch):
     result = data_layer.get_option_flatfile_data(
         underlying_ticker="XYZ",
         as_of="2024-03-07",
+        as_to="2024-03-07",
         base_dir=base,
     )
     assert len(result) == 1
