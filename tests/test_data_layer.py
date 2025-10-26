@@ -2,6 +2,8 @@ import os
 import logging
 import sys
 from pathlib import Path
+import builtins
+from datetime import date
 
 import pandas as pd
 import pytest
@@ -141,22 +143,54 @@ def test_load_or_fetch_contracts_skips_coverage_on_empty(monkeypatch, tmp_path):
 def test_polygon_flatfile_client_logs_and_returns(monkeypatch, caplog):
     class Result:
         stdout = "                           PRE global_crypto/\n                           PRE global_forex/\n"
+        stderr = ""
 
-    captured_cmd = {}
+    commands = []
 
     def fake_run(cmd, check, capture_output, text):
-        captured_cmd["cmd"] = cmd
+        commands.append(cmd)
+        if len(cmd) >= 3 and cmd[1] == "configure":
+            return Result()
         return Result()
 
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIA_TEST")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "SECRET_TEST")
     monkeypatch.setattr(data_layer.subprocess, "run", fake_run)
 
     client = data_layer.PolygonFlatfileClient()
     with caplog.at_level(logging.INFO):
         output = client.list_root_directories()
 
-    assert captured_cmd["cmd"][:4] == ["aws", "s3", "ls", "s3://flatfiles/"]
+    assert commands[2][:4] == ["aws", "s3", "ls", "s3://flatfiles/"]
+    assert commands[0][:3] == ["aws", "configure", "set"]
     assert output == ["global_crypto/", "global_forex/"]
     assert any("global_crypto" in message for message in caplog.messages)
+
+
+def test_polygon_flatfile_client_list_files_for_month(monkeypatch):
+    class Result:
+        stdout = (
+            "2024-03-07 00:00:00          0 2024-03-07.csv.gz\n"
+            "2024-03-08 00:00:00          0 2024-03-08.csv.gz\n"
+        )
+        stderr = ""
+
+    commands = []
+
+    def fake_run(cmd, check, capture_output, text):
+        commands.append(cmd)
+        return Result()
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIA_TEST")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "SECRET_TEST")
+    monkeypatch.setattr(data_layer.subprocess, "run", fake_run)
+
+    client = data_layer.PolygonFlatfileClient()
+    files = client.list_files_for_month("options", 2024, 3)
+
+    list_cmd = commands[2]
+    assert list_cmd[:4] == ["aws", "s3", "ls", "s3://flatfiles/us_options_opra/day_aggs_v1/2024/03/"]
+    assert files == {"2024-03-07.csv.gz", "2024-03-08.csv.gz"}
 
 
 def test_polygon_flatfile_client_download_single_file(monkeypatch, tmp_path, caplog):
@@ -164,30 +198,34 @@ def test_polygon_flatfile_client_download_single_file(monkeypatch, tmp_path, cap
         stdout = "downloaded"
         stderr = ""
 
-    captured_cmd = {}
+    commands = []
 
     def fake_run(cmd, check, capture_output, text):
-        captured_cmd["cmd"] = cmd
+        commands.append(cmd)
+        if len(cmd) >= 3 and cmd[1] == "configure":
+            return Result()
         return Result()
 
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIA_TEST")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "SECRET_TEST")
     monkeypatch.setattr(data_layer.subprocess, "run", fake_run)
     monkeypatch.chdir(tmp_path)
 
     client = data_layer.PolygonFlatfileClient()
     with caplog.at_level(logging.INFO):
-        dest = client.download_flatfile("stocks", "trades_v1", 2024, 3, 7)
+        dest = client.download_flatfile("stocks", 2024, 3, 7, timeframe="day")
 
     expected_cmd = [
         "aws",
         "s3",
         "cp",
-        "s3://flatfiles/us_stocks_sip/trades_v1/2024/03/2024-03-07.csv.gz",
-        str(tmp_path / "data/flatfiles/us_stocks_sip/trades_v1/2024/03/2024-03-07.csv.gz"),
+        "s3://flatfiles/us_stocks_sip/day_aggs_v1/2024/03/2024-03-07.csv.gz",
+        str(tmp_path / "data/flatfiles/us_stocks_sip/day_aggs_v1/2024/03/2024-03-07.csv.gz"),
         "--endpoint-url",
         "https://files.polygon.io",
     ]
-    assert captured_cmd["cmd"] == expected_cmd
-    assert dest == tmp_path / "data/flatfiles/us_stocks_sip/trades_v1/2024/03/2024-03-07.csv.gz"
+    assert commands[-1] == expected_cmd
+    assert dest == tmp_path / "data/flatfiles/us_stocks_sip/day_aggs_v1/2024/03/2024-03-07.csv.gz"
     assert dest.parent.exists()
     assert any("download complete" in message for message in caplog.messages)
 
@@ -197,28 +235,126 @@ def test_polygon_flatfile_client_download_directory(monkeypatch, tmp_path):
         stdout = "completed"
         stderr = ""
 
-    captured_cmd = {}
+    commands = []
 
     def fake_run(cmd, check, capture_output, text):
-        captured_cmd["cmd"] = cmd
+        commands.append(cmd)
+        if len(cmd) >= 3 and cmd[1] == "configure":
+            return Result()
         return Result()
 
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIA_TEST")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "SECRET_TEST")
     monkeypatch.setattr(data_layer.subprocess, "run", fake_run)
     monkeypatch.chdir(tmp_path)
 
     client = data_layer.PolygonFlatfileClient()
-    dest = client.download_flatfile("options", "trades_v1", 2023, 12)
+    dest = client.download_flatfile("options", 2023, 12)
 
     expected_cmd = [
         "aws",
         "s3",
         "cp",
-        "s3://flatfiles/us_options_opra/trades_v1/2023/12/",
-        str(tmp_path / "data/flatfiles/us_options_opra/trades_v1/2023/12"),
+        "s3://flatfiles/us_options_opra/day_aggs_v1/2023/12/",
+        str(tmp_path / "data/flatfiles/us_options_opra/day_aggs_v1/2023/12"),
         "--endpoint-url",
         "https://files.polygon.io",
         "--recursive",
     ]
-    assert captured_cmd["cmd"] == expected_cmd
-    assert dest == tmp_path / "data/flatfiles/us_options_opra/trades_v1/2023/12"
-    assert dest.exists()
+    assert commands[-1] == expected_cmd
+    assert dest == tmp_path / "data/flatfiles/us_options_opra/day_aggs_v1/2023/12"
+
+
+def test_get_option_flatfile_data_filters(tmp_path, monkeypatch):
+    base = tmp_path / "flatfiles_root"
+    target_dir = base / "us_options_opra" / "day_aggs_v1" / "2024" / "03"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    data = pd.DataFrame(
+        {
+            "ticker": ["O:XYZ240307C00050000", "O:XYZ240307P00040000", "O:ABC240307C00010000"],
+            "volume": [100, 80, 60],
+            "open": [1.0, 2.0, 3.0],
+            "close": [1.5, 2.5, 3.5],
+            "high": [1.6, 2.6, 3.6],
+            "low": [0.9, 1.9, 2.9],
+            "window_start": [
+                "2024-03-07T09:30:00.123456789Z",
+                "2024-03-07T09:30:00.123456789Z",
+                "2024-03-07T09:30:00.123456789Z",
+            ],
+            "transactions": [10, 12, 4],
+        }
+    )
+    path = target_dir / "2024-03-07.csv.gz"
+    data.to_csv(path, index=False, compression="gzip")
+
+    result = data_layer.get_option_flatfile_data(
+        underlying_ticker="XYZ",
+        as_of="2024-03-07",
+        expiration_start="2024-03-07",
+        expiration_end="2024-03-07",
+        strike_lower=45,
+        strike_upper=55,
+        contract_type="call",
+        base_dir=base,
+    )
+
+    assert len(result) == 1
+    assert result.iloc[0]["ticker"] == "O:XYZ240307C00050000"
+    assert "strike_price" in result.columns
+    assert float(result.iloc[0]["strike_price"]) == 50.0
+    assert result.iloc[0]["window_start"] == date(2024, 3, 7)
+
+
+def test_get_option_flatfile_data_missing_file(tmp_path):
+    base = tmp_path / "flatfiles_root"
+    base.mkdir(parents=True, exist_ok=True)
+
+    result = data_layer.get_option_flatfile_data(
+        underlying_ticker="XYZ",
+        as_of="2024-03-07",
+        base_dir=base,
+    )
+    assert result.empty
+
+
+def test_get_option_flatfile_data_triggers_download(tmp_path, monkeypatch):
+    base = tmp_path / "flatfiles_root"
+    base.mkdir(parents=True, exist_ok=True)
+
+    class FakeClient:
+        def __init__(self):
+            self.calls: list[tuple] = []
+
+        def list_files_for_month(self, data_type, year, month, timeframe="day"):
+            self.calls.append(("list", data_type, year, month, timeframe))
+            return {f"{year:04d}-{month:02d}-07.csv.gz"}
+
+        def download_flatfile(self, data_type, year, month, day=None, timeframe="day", available_files=None):
+            self.calls.append((data_type, year, month, day, timeframe))
+            expiration = pd.Timestamp(year=year, month=month, day=day)
+            path = data_layer._option_flatfile_path(expiration, base)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(
+                {
+                    "ticker": ["O:XYZ240307C00050000"],
+                    "volume": [10],
+                    "open": [1.0],
+                    "close": [1.5],
+                    "high": [1.6],
+                    "low": [0.9],
+                    "window_start": ["2024-03-07T09:30:00.123456789Z"],
+                    "transactions": [5],
+                }
+            ).to_csv(path, index=False, compression="gzip")
+            return path
+
+    monkeypatch.setattr(data_layer, "PolygonFlatfileClient", FakeClient)
+
+    result = data_layer.get_option_flatfile_data(
+        underlying_ticker="XYZ",
+        as_of="2024-03-07",
+        base_dir=base,
+    )
+    assert len(result) == 1
+    assert result.iloc[0]["ticker"] == "O:XYZ240307C00050000"
