@@ -47,6 +47,7 @@ from .restapi import (
     fetch_option_contracts,
     get_market_data,
     get_options_data,
+    FundamentalDataClient,
 )
 
 # Re-export subprocess for compatibility with historical monkeypatches.
@@ -82,6 +83,7 @@ __all__ = [
     "get_option_flatfile_data",
     "get_options_data",
     "get_stock_flatfile_data",
+    "FundamentalDataClient",
     "make_option_contract_key",
     "make_option_key",
     "make_stock_key",
@@ -92,4 +94,3 @@ __all__ = [
     "write_hdf",
     "subprocess",
 ]
-

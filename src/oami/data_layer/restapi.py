@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 import sys
 from datetime import date, datetime, timedelta
@@ -24,6 +25,7 @@ from oami.utils.cache_manager import (
 )
 
 from ..config import Settings
+from ..logging_config import setup_json_logging
 SET = Settings()
 
 INTERVAL_CONFIG: dict[str, dict[str, object]] = {
@@ -46,6 +48,18 @@ def _progress(iterable, *, desc: str, total: int | None = None):
     if progress_fn is None:
         from .flatfiles import _progress_iter as progress_fn  # pylint: disable=import-outside-toplevel
     yield from progress_fn(iterable, desc=desc, total=total)
+
+
+def _ensure_logging() -> None:
+    """Initialize default logging if no handlers are registered."""
+
+    root = logging.getLogger()
+    has_file_handler = any(isinstance(handler, logging.FileHandler) for handler in root.handlers)
+    if not has_file_handler:
+        try:
+            setup_json_logging()
+        except Exception:  # pragma: no cover - fallback for unexpected initialization issues
+            logging.basicConfig(level=logging.DEBUG)
 
 def _load_or_fetch_contracts(
     symbol: str,
@@ -1174,6 +1188,198 @@ def get_options_data(
     result["ohlcv"] = ohlcv_series
     result.index.name = "ticker"
     return result
+
+
+class FundamentalDataClient:
+    """Simple loader for cached Polygon fundamentals with optional remote fallback."""
+
+    VALID_TIMEFRAMES = {"annual", "quarterly", "ttm"}
+    DEFAULT_TIMEFRAME = "annual"
+    DATE_COLUMNS = (
+        "filing_date",
+        "calendar_date",
+        "financials.filing_date",
+        "financials.calendar_date",
+        "period_end_date",
+        "fiscal_period",
+        "fiscal_end_date",
+        "date",
+    )
+
+    def __init__(
+        self,
+        ticker: str,
+        start: str,
+        end: str,
+        timeframe: str | None = None,
+        use_cache: bool = False,
+    ) -> None:
+        try:
+            start_dt = pd.to_datetime(start).date()
+            end_dt = pd.to_datetime(end).date()
+        except (TypeError, ValueError) as exc:
+            raise ValueError("start and end must be ISO-8601 compatible dates") from exc
+        if start_dt > end_dt:
+            raise ValueError("start must be on or before end")
+
+        timeframe_normalized = (timeframe or self.DEFAULT_TIMEFRAME).lower()
+        if timeframe_normalized not in self.VALID_TIMEFRAMES:
+            raise ValueError(f"timeframe must be one of {sorted(self.VALID_TIMEFRAMES)}")
+
+        self.ticker = ticker.upper().strip()
+        self.start_date = start_dt
+        self.end_date = end_dt
+        self.timeframe = timeframe_normalized
+        self._key = f"/fundamentals/{self.ticker}/{self.timeframe}"
+        self.use_cache = bool(use_cache)
+
+    def load(self, json: bool = True):
+        """Return fundamentals between the configured start/end window.
+
+        Parameters
+        ----------
+        json : bool, default True
+            When ``True`` the payload is returned as a list of JSON-compatible
+            dictionaries. Otherwise a pandas DataFrame is returned.
+        """
+
+        frame: pd.DataFrame | None = None
+        if self.use_cache:
+            frame = self._load_from_cache()
+        if frame is None or frame.empty:
+            frame = self._fetch_from_polygon(store=self.use_cache)
+        if frame is None or frame.empty:
+            return [] if json else pd.DataFrame()
+        masked = self._mask_by_window(frame)
+        return masked.to_dict(orient="records") if json else masked
+
+    def _load_from_cache(self) -> pd.DataFrame | None:
+        try:
+            frame = read_hdf(self._key)
+        except (FileNotFoundError, KeyError, OSError, ValueError):
+            return None
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            return None
+        return frame
+
+    def _fetch_from_polygon(self, *, store: bool) -> pd.DataFrame | None:
+        api_key = os.getenv("POLYGON_API_KEY") or SET.api_key
+        if not api_key or api_key == "YOUR_KEY_HERE":
+            logging.warning(
+                "Skipping fundamentals fetch; Polygon API key missing.",
+                extra={"ticker": self.ticker},
+            )
+            return None
+
+        base_url = "https://api.polygon.io/vX/reference/financials"
+        params = {
+            "ticker": self.ticker,
+            "filing_date.gte": self.start_date.isoformat(),
+            "filing_date.lte": self.end_date.isoformat(),
+            "timeframe": self.timeframe,
+            "order": "asc",
+            "sort": "filing_date",
+            "limit": 100,
+            "apiKey": api_key,
+        }
+        logging.info(
+            "Fundamentals request prepared",
+            extra={"url": base_url, "params": params},
+        )
+
+        frames: list[pd.DataFrame] = []
+        url = base_url
+        first_page = True
+
+        while url:
+            _ensure_logging()
+            logging.info(
+                "Fetching fundamentals",
+                extra={
+                    "ticker": self.ticker,
+                    "timeframe": self.timeframe,
+                    "url": url if first_page else "next_url",
+                },
+            )
+            try:
+                resp = requests.get(url, params=params if first_page else None)
+            except requests.exceptions.RequestException as exc:
+                logging.error(
+                    "Fundamentals request failed",
+                    extra={"ticker": self.ticker, "error": str(exc)},
+                )
+                break
+
+            logging.debug(
+                "Fundamentals response",
+                extra={
+                    "ticker": self.ticker,
+                    "status": resp.status_code,
+                    "body": resp.text,
+                    "headers": dict(resp.headers),
+                },
+            )
+
+            if resp.status_code != 200:
+                logging.error(
+                    "Fundamentals HTTP error",
+                    extra={"ticker": self.ticker, "status": resp.status_code, "body": resp.text[:500]},
+                )
+                break
+
+            try:
+                payload = resp.json()
+            except ValueError as exc:
+                logging.error(
+                    "Failed to decode fundamentals JSON",
+                    extra={"ticker": self.ticker, "error": str(exc)},
+                )
+                break
+            results = payload.get("results", [])
+            if results:
+                frames.append(pd.json_normalize(results))
+
+            next_url = payload.get("next_url")
+            if not next_url:
+                break
+
+            url = next_url
+            params = None
+            if "apiKey" not in url:
+                connector = "&" if "?" in url else "?"
+                url = f"{url}{connector}apiKey={SET.api_key}"
+            first_page = False
+
+        if not frames:
+            return None
+
+        combined = pd.concat(frames, ignore_index=True)
+        if store:
+            try:
+                write_hdf(combined, self._key)
+            except Exception as exc:  # pragma: no cover - cache write guard
+                logging.error(
+                    "Failed to cache fundamentals",
+                    extra={"ticker": self.ticker, "timeframe": self.timeframe, "error": str(exc)},
+                )
+
+        return combined
+
+    def _mask_by_window(self, frame: pd.DataFrame) -> pd.DataFrame:
+        date_col = self._detect_date_column(frame)
+        if date_col is None:
+            return frame
+        filtered = frame.copy()
+        filtered[date_col] = pd.to_datetime(filtered[date_col], errors="coerce", format="ISO8601")
+        filtered = filtered.dropna(subset=[date_col])
+        mask = (filtered[date_col].dt.date >= self.start_date) & (filtered[date_col].dt.date <= self.end_date)
+        return filtered.loc[mask].reset_index(drop=True)
+
+    def _detect_date_column(self, frame: pd.DataFrame) -> str | None:
+        for candidate in self.DATE_COLUMNS:
+            if candidate in frame.columns:
+                return candidate
+        return None
 
 
 def _persist_option_buckets(

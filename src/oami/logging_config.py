@@ -125,7 +125,7 @@ def setup_json_logging(log_file: str | None = None) -> None:
 
     # Get the root logger and attach handlers
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
+    root_logger.setLevel(logging.DEBUG)
 
     # Remove any existing handlers to avoid duplicates in notebooks
     if root_logger.handlers:
