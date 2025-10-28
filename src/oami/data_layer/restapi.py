@@ -1,3 +1,10 @@
+"""REST-based data acquisition for Polygon services.
+
+This module collects helper functions that talk directly to Polygon's REST
+APIs.  It includes resilient fetchers for market data, options metadata, and
+fundamental filings, along with caching helpers that persist results to HDF5.
+"""
+
 import logging
 import os
 import re
@@ -39,7 +46,13 @@ INTERVAL_CONFIG: dict[str, dict[str, object]] = {
 
 
 def _progress(iterable, *, desc: str, total: int | None = None):
-    """Delegate progress iteration to the top-level package to honor monkeypatches."""
+    """Yield progress updates using whichever iterator the package exposes.
+
+    The test-suite frequently monkeypatches ``oami.data_layer._progress_iter``.
+    Rather than importing that symbol directly, this helper asks the package
+    for the active implementation at runtime and falls back to the flatfile
+    iterator when no override is registered.
+    """
 
     progress_fn = None
     dl = sys.modules.get("oami.data_layer")
@@ -51,7 +64,7 @@ def _progress(iterable, *, desc: str, total: int | None = None):
 
 
 def _ensure_logging() -> None:
-    """Initialize default logging if no handlers are registered."""
+    """Ensure structured logging is configured before issuing HTTP requests."""
 
     root = logging.getLogger()
     has_file_handler = any(isinstance(handler, logging.FileHandler) for handler in root.handlers)
@@ -1191,7 +1204,21 @@ def get_options_data(
 
 
 class FundamentalDataClient:
-    """Simple loader for cached Polygon fundamentals with optional remote fallback."""
+    """Retrieve Polygon fundamentals over a filing-date window.
+
+    Parameters
+    ----------
+    ticker : str
+        The instrument symbol (equity ticker) to request.
+    start, end : str
+        Inclusive ISO-8601 dates used to bound ``filing_date``.
+    timeframe : str, optional
+        Polygon reporting cadence. Valid options are ``\"annual\"`` (default),
+        ``\"quarterly\"``, and ``\"ttm\"``.
+    use_cache : bool, default False
+        When ``True`` the client attempts to read/write cached responses
+        under ``/fundamentals/{ticker}/{timeframe}`` in the shared HDF store.
+    """
 
     VALID_TIMEFRAMES = {"annual", "quarterly", "ttm"}
     DEFAULT_TIMEFRAME = "annual"
@@ -1234,13 +1261,18 @@ class FundamentalDataClient:
         self.use_cache = bool(use_cache)
 
     def load(self, json: bool = True):
-        """Return fundamentals between the configured start/end window.
+        """Return fundamentals for the configured window.
 
         Parameters
         ----------
         json : bool, default True
-            When ``True`` the payload is returned as a list of JSON-compatible
-            dictionaries. Otherwise a pandas DataFrame is returned.
+            When ``True`` return a list of JSON-compatible dictionaries.
+            When ``False`` return a pandas DataFrame.
+
+        Returns
+        -------
+        list[dict] | pandas.DataFrame
+            Fundamental filings bounded by ``start``/``end``.
         """
 
         frame: pd.DataFrame | None = None
@@ -1263,6 +1295,7 @@ class FundamentalDataClient:
         return frame
 
     def _fetch_from_polygon(self, *, store: bool) -> pd.DataFrame | None:
+        """Request fundamentals from Polygon, optionally persisting the result."""
         api_key = os.getenv("POLYGON_API_KEY") or SET.api_key
         if not api_key or api_key == "YOUR_KEY_HERE":
             logging.warning(
@@ -1366,6 +1399,7 @@ class FundamentalDataClient:
         return combined
 
     def _mask_by_window(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Filter the response to rows whose filing dates fall inside the window."""
         date_col = self._detect_date_column(frame)
         if date_col is None:
             return frame

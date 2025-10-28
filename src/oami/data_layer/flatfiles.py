@@ -1,4 +1,12 @@
-"""Utilities for interacting with Polygon flatfile datasets."""
+"""Flatfile ingestion utilities for Polygon datasets.
+
+This module centralises all interactions with Polygon's S3-hosted flatfiles.
+It is responsible for downloading stock and options aggregates, hydrating local
+cache directories, and exposing helpers that higher-level data components rely
+on.  The functions here are intentionally lightweight wrappers around the AWS
+CLI so they can operate in restricted environments where a full S3 SDK may not
+be available.
+"""
 
 from __future__ import annotations
 
@@ -23,6 +31,12 @@ OCC_TICKER_RE = re.compile(r"O:([A-Z]{1,6})(\d{2})(\d{2})(\d{2})([CP])(\d{8})")
 
 
 def _resolve_client_class() -> type["PolygonFlatfileClient"]:
+    """Return the active ``PolygonFlatfileClient`` implementation.
+
+    Tests sometimes monkeypatch the class exported by ``oami.data_layer`` so we
+    consult the package first, falling back to the local definition if the
+    package has not been manipulated.
+    """
     dl = sys.modules.get("oami.data_layer")
     if dl is not None:
         client_cls = getattr(dl, "PolygonFlatfileClient", None)
