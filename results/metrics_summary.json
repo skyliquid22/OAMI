@@ -1,0 +1,11 @@
+{
+  "total_return": 0.09899999999999998,
+  "annualized_return": 0.2685692645342357,
+  "sharpe_ratio": 152.38612411346685,
+  "sortino_ratio": NaN,
+  "max_drawdown": 0.0,
+  "volatility": 0.0015618432633664621,
+  "win_rate": 1.0,
+  "average_trade_return": 0.0009444573070521578,
+  "average_drawdown_duration": 0.0
+}
