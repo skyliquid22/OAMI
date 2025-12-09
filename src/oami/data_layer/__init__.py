@@ -49,6 +49,7 @@ from .restapi import (
     get_options_data,
     FundamentalDataClient,
 )
+from .storage_manager import build_option_cache, build_ticker_cache, load_option_data, load_ticker_data
 
 # Re-export subprocess for compatibility with historical monkeypatches.
 subprocess = flatfiles.subprocess
@@ -84,6 +85,10 @@ __all__ = [
     "get_options_data",
     "get_stock_flatfile_data",
     "FundamentalDataClient",
+    "build_ticker_cache",
+    "load_ticker_data",
+    "build_option_cache",
+    "load_option_data",
     "make_option_contract_key",
     "make_option_key",
     "make_stock_key",

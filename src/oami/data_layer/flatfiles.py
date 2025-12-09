@@ -187,7 +187,7 @@ def _parse_stock_flatfile_date(filename: str) -> date | None:
 
 
 def _subtract_years(anchor: date, years: int) -> date:
-    """Return the calendar date ``years`` prior to ``anchor``."""
+    """Return the calendar date ``years`` prior to ``anchor."""
 
     try:
         return anchor.replace(year=anchor.year - years)
@@ -516,7 +516,29 @@ def get_option_flatfile_data(
     contract_type: str | None = None,
     base_dir: Path | None = None,
 ) -> pd.DataFrame:
-    """Collect option flatfile rows across the requested expiration window."""
+    """
+    Collect Polygon option flatfiles and filter contracts by strikes, expiries, and type.
+
+    Parameters
+    ----------
+    underlying_ticker : str
+        Underlying ticker symbol (e.g. "SPY").
+    as_of, as_to : str or None, optional
+        Inclusive flatfile download window in ISO format. Defaults to the last two years when omitted.
+    expiration_start, expiration_end : str or None, optional
+        Optional inclusive expiration-date filter.
+    strike_lower, strike_upper : float or None, optional
+        Optional strike-price bounds.
+    contract_type : str or None, optional
+        Contract type filter ("CALL" or "PUT").
+    base_dir : pathlib.Path or None, optional
+        Override for the local flatfile cache root. Defaults to ``data/flatfiles``.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Aggregated option rows satisfying the supplied filters. Empty when no contracts match."""
+    """Collect Polygon option flatfiles and filter contracts by strikes, expiries, and type."""
 
     today = date.today()
     default_start = _subtract_years(today, 2)
@@ -550,11 +572,15 @@ def get_option_flatfile_data(
     missing_dates: list[pd.Timestamp] = []
 
     for expiration in date_list:
+        local_path = _option_flatfile_path(expiration, storage_root)
+        if not local_path.exists():
+            missing_dates.append(expiration)
+            continue
         df_cached = _load_option_flatfile_for_date(expiration, storage_root)
         if df_cached.empty:
             missing_dates.append(expiration)
-        else:
-            existing_frames[expiration] = df_cached
+            continue
+        existing_frames[expiration] = df_cached
 
     if missing_dates:
         if flatfile_client is None:
@@ -652,7 +678,23 @@ def get_option_flatfile_data(
 def get_stock_flatfile_data(
     ticker: str, start: str = "2020-01-01", end: str | None = None
 ) -> pd.DataFrame:
-    """Download and aggregate Polygon stock trade flatfiles for ``ticker``."""
+    """Download and aggregate Polygon daily stock flatfiles for a ticker.
+
+    Parameters
+    ----------
+    ticker : str
+        Underlying ticker symbol (e.g. "SPY").
+    start : str, default "2020-01-01"
+        Inclusive start date in ISO format. Clamped to Polygon's five-year mirror if older.
+    end : str or None, default None
+        Inclusive end date in ISO format. Defaults to today when omitted.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Concatenated daily stock aggregates (OHLCV plus metadata). The frame is empty when
+        no data is available within the requested window..
+    """
 
     try:
         start_date = pd.to_datetime(start).date()

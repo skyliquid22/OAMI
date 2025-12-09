@@ -1,5 +1,6 @@
 import os
 import logging
+import sqlite3
 import sys
 from pathlib import Path
 import builtins
@@ -46,6 +47,116 @@ def test_cache_path_and_io(tmp_path):
     loaded = pd.read_csv(p)
     assert not loaded.empty
     assert "Close" in loaded.columns
+
+
+def test_build_and_load_ticker_cache(tmp_path):
+    raw_root = tmp_path / "raw" / "us_stocks_sip" / "day_aggs_v1"
+    month_dir = raw_root / "2024" / "01"
+    month_dir.mkdir(parents=True, exist_ok=True)
+
+    day_one = pd.DataFrame(
+        [
+            {
+                "ticker": "AAPL",
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.5,
+                "close": 100.5,
+                "volume": 1_000,
+                "window_start": "2024-01-01T09:30:00Z",
+            },
+            {
+                "ticker": "MSFT",
+                "open": 200.0,
+                "high": 205.0,
+                "low": 198.0,
+                "close": 204.0,
+                "volume": 2_000,
+                "window_start": "2024-01-01T09:30:00Z",
+            },
+        ]
+    )
+    day_one.to_csv(month_dir / "2024-01-01.csv.gz", index=False, compression="gzip")
+
+    day_two = pd.DataFrame(
+        [
+            {
+                "ticker": "AAPL",
+                "open": 101.0,
+                "high": 102.0,
+                "low": 100.0,
+                "close": 101.5,
+                "volume": 1_100,
+                "window_start": "2024-01-02T09:30:00Z",
+            },
+            {
+                "ticker": "MSFT",
+                "open": 204.0,
+                "high": 206.0,
+                "low": 203.0,
+                "close": 205.5,
+                "volume": 2_100,
+                "window_start": "2024-01-02T09:30:00Z",
+            },
+        ]
+    )
+    day_two.to_csv(month_dir / "2024-01-02.csv.gz", index=False, compression="gzip")
+
+    cache_root = tmp_path / "cache" / "stocks"
+    meta_path = tmp_path / "meta" / "stocks_index.db"
+
+    results = data_layer.build_ticker_cache(
+        ["AAPL", "MSFT"],
+        raw_root=raw_root,
+        cache_root=cache_root,
+        meta_path=meta_path,
+    )
+
+    assert set(results) == {"AAPL", "MSFT"}
+    for path in results.values():
+        assert Path(path).exists()
+
+    conn = sqlite3.connect(meta_path)
+    meta_rows = conn.execute(
+        "SELECT ticker, start_date, end_date, rows FROM stocks_cache_index ORDER BY ticker"
+    ).fetchall()
+    conn.close()
+
+    assert meta_rows == [
+        ("AAPL", "2024-01-01", "2024-01-02", 2),
+        ("MSFT", "2024-01-01", "2024-01-02", 2),
+    ]
+
+    loaded = data_layer.load_ticker_data(
+        ["AAPL", "MSFT"],
+        "2024-01-01",
+        "2024-01-02",
+        cache_root=cache_root,
+        meta_path=meta_path,
+    )
+
+    assert len(loaded) == 4
+    assert set(loaded["ticker"]) == {"AAPL", "MSFT"}
+    assert loaded["window_start"].min() == pd.Timestamp("2024-01-01 09:30:00")
+    assert loaded["window_start"].max() == pd.Timestamp("2024-01-02 09:30:00")
+
+    data_layer.build_ticker_cache(
+        ["AAPL", "MSFT"],
+        raw_root=raw_root,
+        cache_root=cache_root,
+        meta_path=meta_path,
+    )
+
+    loaded_again = data_layer.load_ticker_data(
+        ["AAPL", "MSFT"],
+        "2024-01-01",
+        "2024-01-02",
+        cache_root=cache_root,
+        meta_path=meta_path,
+    )
+
+    assert len(loaded_again) == len(loaded)
+    pd.testing.assert_frame_equal(loaded.sort_index(axis=1), loaded_again.sort_index(axis=1))
 
 
 def test_get_options_data_structured_output(monkeypatch):
@@ -372,3 +483,147 @@ def test_get_option_flatfile_data_triggers_download(tmp_path, monkeypatch):
     )
     assert len(result) == 1
     assert result.iloc[0]["ticker"] == "O:XYZ240307C00050000"
+
+
+def test_build_option_cache_filters_and_persists(tmp_path):
+    flatfile_root = tmp_path / "flatfiles"
+    cache_root = tmp_path / "cache"
+    day_dir = flatfile_root / "us_options_opra" / "day_aggs_v1" / "2025" / "03"
+    day_dir.mkdir(parents=True, exist_ok=True)
+
+    ts_1 = pd.Timestamp("2025-03-10 09:30:00")
+    ts_2 = pd.Timestamp("2025-03-10 10:30:00")
+
+    df_initial = pd.DataFrame(
+        [
+            {
+                "ticker": "O:A250321C00125000",
+                "volume": 10,
+                "open": 1.0,
+                "close": 1.2,
+                "high": 1.3,
+                "low": 0.9,
+                "window_start": ts_1.value,
+                "transactions": 5,
+            },
+            {
+                "ticker": "O:A250321P00125000",
+                "volume": 15,
+                "open": 2.0,
+                "close": 2.2,
+                "high": 2.4,
+                "low": 1.8,
+                "window_start": ts_2.value,
+                "transactions": 6,
+            },
+            {
+                # Different underlying, should be excluded.
+                "ticker": "O:B250321C00125000",
+                "volume": 50,
+                "open": 5.0,
+                "close": 5.5,
+                "high": 5.7,
+                "low": 4.9,
+                "window_start": ts_1.value,
+                "transactions": 10,
+            },
+        ]
+    )
+    path_initial = day_dir / "2025-03-10.csv.gz"
+    df_initial.to_csv(path_initial, index=False, compression="gzip")
+
+    result_first = data_layer.build_option_cache(
+        ["A"],
+        "2025-03-10",
+        "2025-03-10",
+        flatfile_root=flatfile_root,
+        cache_root=cache_root,
+    )
+
+    expected_columns = [
+        "ticker",
+        "volume",
+        "open",
+        "close",
+        "high",
+        "low",
+        "window_start",
+        "underlying_symbol",
+        "strike_price",
+        "contract_type",
+        "expiration_date",
+    ]
+
+    assert not result_first.empty
+    assert list(result_first.columns) == expected_columns
+    assert set(result_first["underlying_symbol"]) == {"A"}
+    assert set(result_first["contract_type"]) == {"call", "put"}
+    assert pd.api.types.is_datetime64_ns_dtype(result_first["window_start"])
+    cache_path = cache_root / "A.parquet"
+    assert cache_path.exists()
+    loaded_first = pd.read_parquet(cache_path)
+    pd.testing.assert_frame_equal(result_first, loaded_first)
+
+    ts_next = pd.Timestamp("2025-03-11 09:30:00")
+    df_follow_up = pd.DataFrame(
+        [
+            {
+                "ticker": "O:A250321C00125000",
+                "volume": 8,
+                "open": 1.1,
+                "close": 1.0,
+                "high": 1.2,
+                "low": 0.8,
+                "window_start": ts_next.value,
+                "transactions": 7,
+            }
+        ]
+    )
+    path_follow_up = day_dir / "2025-03-11.csv.gz"
+    df_follow_up.to_csv(path_follow_up, index=False, compression="gzip")
+
+    result_second = data_layer.build_option_cache(
+        ["A"],
+        "2025-03-11",
+        "2025-03-11",
+        flatfile_root=flatfile_root,
+        cache_root=cache_root,
+    )
+
+    assert len(result_second) == len(result_first) + 1
+    assert (result_second["window_start"] == ts_next.normalize()).any()
+
+    multi_result = data_layer.build_option_cache(
+        ["A", "B"],
+        "2025-03-10",
+        "2025-03-11",
+        flatfile_root=flatfile_root,
+        cache_root=cache_root,
+    )
+
+    assert set(multi_result) == {"A", "B"}
+    assert not multi_result["A"].empty
+    assert set(multi_result["B"]["underlying_symbol"]) == {"B"}
+
+    loaded = data_layer.load_option_data(
+        ["A"],
+        "2025-03-10",
+        "2025-03-11",
+        flatfile_root=flatfile_root,
+        cache_root=cache_root,
+    )
+
+    assert len(loaded) == len(result_second)
+    assert set(loaded["contract_type"]) == {"call", "put"}
+    assert loaded["window_start"].min() == pd.Timestamp("2025-03-10")
+    assert loaded["window_start"].max() == pd.Timestamp("2025-03-11")
+
+    empty = data_layer.load_option_data(
+        ["C"],
+        "2025-03-10",
+        "2025-03-11",
+        flatfile_root=flatfile_root,
+        cache_root=cache_root,
+        rebuild_missing=False,
+    )
+    assert empty.empty

@@ -11,14 +11,15 @@ import numpy as np
 import pandas as pd
 
 try:  # pragma: no cover - heavy dependency
-    from finrl.env.env_stocktrading import StockTradingEnv
     from finrl.agents.stablebaselines3.models import DRLAgent
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
         "This pipeline requires the FinRL package. Install via `pip install finrl` before running."
     ) from exc
 
-from src.preprocessing.custom_preprocessor import CustomFinRLPreprocessor
+from oami.preprocessing.custom_preprocessor import CustomFinRLPreprocessor
+from oami.visualization.metrics_dashboard import MetricsDashboard
+from oami.envs.institutional_trading_env import InstitutionalTradingEnv
 
 RESULTS_DIR = Path("./results")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -50,20 +51,21 @@ def run_pipeline(market_path: str | Path, options_path: str | Path, train_end: s
     tech_indicator_list = _collect_indicators(df_features)
     print("✅ Technical indicators used:", tech_indicator_list)
 
+    stock_dim = df_features["tic"].nunique()
     env_kwargs = {
         "hmax": 100,
         "initial_amount": 1_000_000,
         "buy_cost_pct": 0.001,
         "sell_cost_pct": 0.001,
-        "state_space": len(tech_indicator_list) + 2,
-        "stock_dim": df_features["tic"].nunique(),
+        "state_space": 1 + 2 * stock_dim + len(tech_indicator_list),
+        "stock_dim": stock_dim,
         "tech_indicator_list": tech_indicator_list,
-        "action_space": df_features["tic"].nunique(),
+        "action_space": stock_dim,
         "reward_scaling": 1e-4,
     }
 
-    env_train = StockTradingEnv(df=df_train, **env_kwargs)
-    env_trade = StockTradingEnv(df=df_test, **env_kwargs)
+    env_train = InstitutionalTradingEnv(df=df_train, **env_kwargs)
+    env_trade = InstitutionalTradingEnv(df=df_test, **env_kwargs)
 
     agent = DRLAgent(env=env_train)
     model_kwargs = {"n_steps": 2048, "ent_coef": 0.005, "learning_rate": 1e-4, "batch_size": 128}
@@ -85,6 +87,10 @@ def run_pipeline(market_path: str | Path, options_path: str | Path, train_end: s
     end_value = df_account_value.iloc[-1]["account_value"]
     total_return = (end_value / start_value) - 1.0
     print(f"✅ Simulation complete, total return: {total_return:.2%}")
+
+    dashboard = MetricsDashboard(title="Training Pipeline Performance")
+    dashboard.bulk_load(df_account_value)
+    dashboard.compute_metrics()
 
 
 def parse_args() -> argparse.Namespace:
