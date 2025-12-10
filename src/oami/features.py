@@ -1,10 +1,13 @@
-"""Option feature engineering utilities with tenor-aware aggregation.
+"""Feature engineering utilities for options and equities.
 
-This module exposes an :class:`OptionFeatureBuilder` capable of transforming raw
-market and option contract data into daily, per-underlying metrics that capture
-sentiment, implied volatility term-structure, and gamma exposure across tenor
-buckets.  The resulting feature set is suitable for downstream modelling
-pipelines such as reinforcement learning agents or machine learning workflows.
+This module exposes two primary builders:
+
+- :class:`OptionFeatureBuilder` transforms raw market and option contract data
+  into tenor-aware sentiment, volatility, and gamma metrics suited for modelling
+  pipelines (e.g., RL agents or ML workflows).
+- :class:`StockFeatureBuilder` derives leakage-safe technical indicators from
+  OHLCV market data, including trend, momentum, volatility, and liquidity
+  proxies with optional lagging, normalization, and calendar features.
 """
 
 from __future__ import annotations
@@ -25,7 +28,28 @@ try:  # pragma: no cover - optional dependency at runtime
 except ImportError:  # pragma: no cover - fallback to internal implementation
     _HAVE_PY_VOLLIB = False
 
-__all__ = ["OptionFeatureBuilder"]
+try:  # pragma: no cover - optional imports
+    import ta  # type: ignore
+    from ta.momentum import RSIIndicator as TaRSIIndicator
+    from ta.trend import MACD as TaMACD
+    from ta.volume import OnBalanceVolumeIndicator as TaOBV
+    from ta.volatility import AverageTrueRange as TaATR
+except Exception:  # pragma: no cover
+    ta = None
+    TaRSIIndicator = None
+    TaMACD = None
+    TaOBV = None
+    TaATR = None
+
+try:  # pragma: no cover - optional TA-Lib
+    import talib  # type: ignore
+except Exception:  # pragma: no cover
+    talib = None
+
+_TA_AVAILABLE = ta is not None
+_TALIB_AVAILABLE = talib is not None
+
+__all__ = ["OptionFeatureBuilder", "StockFeatureBuilder"]
 
 
 @dataclass(frozen=True)
@@ -509,6 +533,223 @@ class OptionFeatureBuilder:
         return result
 
 
+class StockFeatureBuilder:
+    """Engineer leakage-safe technical indicators from OHLCV market data."""
+
+    def __init__(
+        self,
+        windows: Sequence[int] = (5, 10, 20, 60),
+        *,
+        norm_window: int = 60,
+        add_calendar_features: bool = True,
+        add_normalized_features: bool = True,
+        use_ta: bool = True,
+        use_talib: bool = False,
+        lag_features: tuple[int, ...] = (1,),
+        rsi_window: int = 14,
+    ) -> None:
+        cleaned_windows = tuple(int(w) for w in windows if int(w) > 0)
+        if not cleaned_windows:
+            raise ValueError("windows must contain at least one positive integer")
+        self.windows = cleaned_windows
+        self.norm_window = max(1, int(norm_window))
+        self.add_calendar_features = add_calendar_features
+        self.add_normalized_features = add_normalized_features
+        self.use_ta = bool(use_ta) and _TA_AVAILABLE
+        self.use_talib = bool(use_talib) and _TALIB_AVAILABLE
+        lag_set = {int(lag) for lag in lag_features if int(lag) > 0}
+        self.lag_features = tuple(sorted(lag_set))
+        self.rsi_window = max(1, int(rsi_window))
+
+    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Return df augmented with leakage-safe technical indicators."""
+        required = {"date", "tic", "open", "high", "low", "close", "volume"}
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError(f"Input DataFrame is missing required columns: {', '.join(sorted(missing))}")
+
+        data = df.copy()
+        data["date"] = pd.to_datetime(data["date"], utc=False, errors="coerce")
+        data = data.sort_values(["tic", "date"]).reset_index(drop=True)
+
+        original_columns = list(data.columns)
+        enriched = data.groupby("tic", group_keys=False).apply(self._compute_group_features).reset_index(drop=True)
+        feature_cols = [col for col in enriched.columns if col not in original_columns]
+
+        if feature_cols:
+            enriched = self._apply_leakage_controls(enriched, feature_cols)
+
+        if self.add_calendar_features:
+            enriched = self._add_calendar_features(enriched)
+
+        return enriched.sort_values(["tic", "date"]).reset_index(drop=True)
+
+    def _compute_group_features(self, group: pd.DataFrame) -> pd.DataFrame:
+        g = group.sort_values("date").copy()
+        for column in ["open", "high", "low", "close", "volume"]:
+            g[column] = pd.to_numeric(g[column], errors="coerce")
+
+        close = g["close"]
+        high = g["high"]
+        low = g["low"]
+        volume = g["volume"]
+
+        close_safe = close.replace(0, np.nan)
+        g["ret_1"] = close_safe.pct_change()
+        g["log_ret_1"] = np.log(close_safe).diff()
+
+        prev_close = close.shift(1)
+        tr_components = pd.concat(
+            [
+                (high - low),
+                (high - prev_close).abs(),
+                (low - prev_close).abs(),
+            ],
+            axis=1,
+        )
+        true_range = tr_components.max(axis=1)
+
+        for window in self.windows:
+            g[f"rv_{window}"] = g["log_ret_1"].rolling(window).std()
+            if self.use_talib:
+                try:
+                    g[f"atr_{window}"] = talib.ATR(
+                        high.to_numpy(dtype=float),
+                        low.to_numpy(dtype=float),
+                        close.to_numpy(dtype=float),
+                        timeperiod=window,
+                    )
+                except Exception:
+                    g[f"atr_{window}"] = true_range.rolling(window).mean()
+            elif self.use_ta and TaATR is not None:
+                atr = TaATR(high=high, low=low, close=close, window=window, fillna=False)
+                g[f"atr_{window}"] = atr.average_true_range()
+            else:
+                g[f"atr_{window}"] = true_range.rolling(window).mean()
+
+            g[f"sma_{window}"] = close.rolling(window).mean()
+            g[f"ema_{window}"] = close.ewm(span=window, adjust=False).mean()
+            g[f"roc_{window}"] = close.pct_change(window)
+
+            vol_mean = volume.rolling(window).mean()
+            vol_std = volume.rolling(window).std()
+            g[f"vol_z_{window}"] = (volume - vol_mean) / (vol_std + 1e-9)
+
+        mid_window = self.windows[min(1, len(self.windows) - 1)]
+        ma_mid = close.rolling(mid_window).mean()
+        sd_mid = close.rolling(mid_window).std()
+        upper = ma_mid + 2.0 * sd_mid
+        lower = ma_mid - 2.0 * sd_mid
+        band_width = upper - lower
+        safe_band_width = band_width.replace(0, np.nan)
+        g[f"bb_pctb_{mid_window}"] = (close - lower) / safe_band_width
+        g[f"bb_bw_{mid_window}"] = band_width / ma_mid.replace(0, np.nan)
+
+        if self.use_ta and TaOBV is not None:
+            obv_indicator = TaOBV(close=close, volume=volume, fillna=False)
+            g["obv"] = obv_indicator.on_balance_volume()
+        else:
+            direction = np.sign(g["ret_1"].fillna(0.0))
+            g["obv"] = (direction * volume.fillna(0.0)).cumsum()
+
+        g["hl_spread"] = (high - low) / close_safe
+        volume_safe = volume.replace(0, np.nan)
+        g["amihud"] = g["ret_1"].abs() / volume_safe
+
+        roll = self.windows[-1]
+        roll_max = close.rolling(roll).max()
+        g[f"mdd_{roll}"] = (close / roll_max) - 1.0
+
+        # RSI
+        rsi_col = f"rsi_{self.rsi_window}"
+        if self.use_talib:
+            try:
+                g[rsi_col] = talib.RSI(close.to_numpy(dtype=float), timeperiod=self.rsi_window)
+            except Exception:
+                g[rsi_col] = self._compute_rsi_manual(close)
+        elif self.use_ta and TaRSIIndicator is not None:
+            rsi_indicator = TaRSIIndicator(close=close, window=self.rsi_window, fillna=False)
+            g[rsi_col] = rsi_indicator.rsi()
+        else:
+            g[rsi_col] = self._compute_rsi_manual(close)
+
+        # MACD
+        if self.use_talib:
+            try:
+                macd, macd_signal, macd_hist = talib.MACD(
+                    close.to_numpy(dtype=float), fastperiod=12, slowperiod=26, signalperiod=9
+                )
+                g["macd"] = macd
+                g["macd_signal"] = macd_signal
+                g["macd_hist"] = macd_hist
+            except Exception:
+                self._compute_macd_manual(g, close)
+        elif self.use_ta and TaMACD is not None:
+            macd_indicator = TaMACD(close=close, window_fast=12, window_slow=26, window_sign=9, fillna=False)
+            g["macd"] = macd_indicator.macd()
+            g["macd_signal"] = macd_indicator.macd_signal()
+            g["macd_hist"] = macd_indicator.macd_diff()
+        else:
+            self._compute_macd_manual(g, close)
+
+        return g
+
+    def _compute_rsi_manual(self, close: pd.Series) -> pd.Series:
+        delta = close.diff()
+        gain = delta.clip(lower=0.0)
+        loss = -delta.clip(upper=0.0)
+        avg_gain = gain.ewm(alpha=1 / self.rsi_window, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1 / self.rsi_window, adjust=False).mean()
+        rs = avg_gain / (avg_loss + 1e-9)
+        return 100 - (100 / (1 + rs))
+
+    def _compute_macd_manual(self, frame: pd.DataFrame, close: pd.Series) -> None:
+        ema_fast = close.ewm(span=12, adjust=False).mean()
+        ema_slow = close.ewm(span=26, adjust=False).mean()
+        macd_line = ema_fast - ema_slow
+        signal = macd_line.ewm(span=9, adjust=False).mean()
+        frame["macd"] = macd_line
+        frame["macd_signal"] = signal
+        frame["macd_hist"] = macd_line - signal
+
+    def _apply_leakage_controls(self, df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
+        if not feature_cols:
+            return df
+
+        lag_values = self.lag_features
+        norm_window = self.norm_window
+        add_norm = self.add_normalized_features
+
+        def _per_group(group: pd.DataFrame) -> pd.DataFrame:
+            g = group.sort_values("date").copy()
+            g[feature_cols] = g[feature_cols].shift(1)
+            if add_norm:
+                for col in feature_cols:
+                    roll = g[col].rolling(norm_window)
+                    mean = roll.mean()
+                    std = roll.std()
+                    g[f"{col}_nz"] = (g[col] - mean) / (std + 1e-9)
+            for lag in lag_values:
+                shifted = g[feature_cols].shift(lag)
+                shifted = shifted.add_suffix(f"_lag{lag}")
+                g = pd.concat([g, shifted], axis=1)
+            return g
+
+        return df.groupby("tic", group_keys=False).apply(_per_group).reset_index(drop=True)
+
+    def _add_calendar_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        enriched = df.copy()
+        enriched["date"] = pd.to_datetime(enriched["date"], utc=False, errors="coerce")
+        dow = enriched["date"].dt.weekday
+        dummies = pd.get_dummies(dow, prefix="dow", dtype=float)
+        for idx in range(7):
+            column = f"dow_{idx}"
+            if column not in dummies:
+                dummies[column] = 0.0
+        dummies = dummies[[f"dow_{i}" for i in range(7)]]
+        return pd.concat([enriched, dummies], axis=1)
+
+
 # --------------------------------------------------------------------------- #
 # Black-Scholes helpers (fallback when py_vollib is unavailable)
 # --------------------------------------------------------------------------- #
@@ -571,3 +812,25 @@ def _implied_volatility_newton(
     if np.isfinite(final_price) and abs(final_price - price) < 1e-3:
         return sigma
     return np.nan
+
+
+if __name__ == "__main__":  # pragma: no cover - basic sanity example
+    import pandas as pd
+
+    sample = pd.DataFrame(
+        {
+            "date": pd.date_range("2024-01-01", periods=5, freq="D").tolist()
+            + pd.date_range("2024-01-01", periods=5, freq="D").tolist(),
+            "tic": ["AAPL"] * 5 + ["MSFT"] * 5,
+            "open": np.linspace(100, 104, 5).tolist() + np.linspace(200, 204, 5).tolist(),
+            "high": np.linspace(101, 105, 5).tolist() + np.linspace(201, 205, 5).tolist(),
+            "low": np.linspace(99, 103, 5).tolist() + np.linspace(199, 203, 5).tolist(),
+            "close": np.linspace(100.5, 104.5, 5).tolist() + np.linspace(200.5, 204.5, 5).tolist(),
+            "volume": [1_000_000 + i * 10_000 for i in range(5)]
+            + [2_000_000 + i * 20_000 for i in range(5)],
+        }
+    )
+
+    builder = StockFeatureBuilder()
+    sample_features = builder.transform(sample)
+    print(sample_features.head())
