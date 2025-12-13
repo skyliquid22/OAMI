@@ -11,7 +11,7 @@ import re
 import sys
 from datetime import date, datetime, timedelta
 from time import perf_counter
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Iterable, Sequence
 
 import pandas as pd
 import requests
@@ -1432,3 +1432,100 @@ def _persist_option_buckets(
             )
         except Exception as exc:
             logging.error("Failed to persist option bucket", extra={"key": key, "error": str(exc)})
+def fetch_snapshot_tickers(
+    *,
+    limit: int | None = None,
+    sort_by: str = "usd_volume",
+    descending: bool = True,
+) -> pd.DataFrame:
+    """Fetch Polygon's full market snapshot and return summary metrics per ticker."""
+    url = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
+    params = {"apiKey": SET.api_key}
+    try:
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:  # pragma: no cover
+        logging.error("Failed to fetch snapshot tickers", extra={"error": str(exc)})
+        raise RuntimeError(f"Snapshot request failed: {exc}") from exc
+
+    tickers = payload.get("tickers") or payload.get("results") or []
+    rows: list[dict[str, object]] = []
+    for entry in tickers:
+        last_trade = entry.get("lastTrade") or entry.get("last_trade") or {}
+        last_quote = entry.get("lastQuote") or entry.get("last_quote") or {}
+        day = entry.get("day") or entry.get("prevDay") or {}
+
+        close_price = (
+            last_trade.get("p")
+            or last_quote.get("p")
+            or last_trade.get("price")
+            or last_quote.get("price")
+            or day.get("close")
+            or day.get("c")
+        )
+        volume_value = (
+            day.get("volume")
+            or day.get("v")
+            or last_trade.get("s")
+            or last_quote.get("s")
+        )
+        rows.append(
+            {
+                "ticker": entry.get("ticker"),
+                "close": close_price,
+                "volume": volume_value,
+                "change_percent": day.get("changePercent") or day.get("change_percent"),
+                "open": day.get("open") or day.get("o"),
+                "high": day.get("high") or day.get("h"),
+                "low": day.get("low") or day.get("l"),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+    df["usd_volume"] = df["close"] * df["volume"]
+    df = df.dropna(subset=["usd_volume", "ticker"])
+    df = df.sort_values(sort_by, ascending=not descending)
+    if limit is not None:
+        df = df.head(limit)
+    return df.reset_index(drop=True)
+
+
+def is_common_stock_ticker(ticker: str) -> bool:
+    """Return True when Polygon classifies the ticker as common stock."""
+    if not ticker:
+        return False
+    url = f"https://api.polygon.io/v3/reference/tickers/{ticker}"
+    params = {"apiKey": SET.api_key}
+    try:
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:  # pragma: no cover
+        logging.error("Failed to fetch ticker reference", extra={"ticker": ticker, "error": str(exc)})
+        raise RuntimeError(f"Ticker reference request failed for {ticker}: {exc}") from exc
+
+    results = payload.get("results") or {}
+    ticker_type = results.get("type")
+    if isinstance(ticker_type, str):
+        ticker_type = ticker_type.strip().lower()
+        return ticker_type == "cs"
+    return False
+
+
+def filter_common_stock_tickers(tickers: Sequence[str]) -> list[str]:
+    """Return tickers classified as common stock via Polygon reference data."""
+    equities: list[str] = []
+    for ticker in tickers:
+        if not ticker:
+            continue
+        try:
+            if is_common_stock_ticker(ticker):
+                equities.append(ticker)
+        except Exception as exc:  # pragma: no cover
+            logging.warning("Skipping ticker due to reference lookup failure", extra={"ticker": ticker, "error": str(exc)})
+    return equities

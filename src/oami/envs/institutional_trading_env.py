@@ -38,7 +38,7 @@ class InstitutionalTradingEnv(OrderTradingEnv):
     - Drawdown and volatility penalties to stabilise RL training
     """
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, exposure_penalty: float = 0.0, **kwargs) -> None:
         if 'num_stock_shares' not in kwargs:
             kwargs['num_stock_shares'] = [0] * kwargs.get('stock_dim', 1)
         super().__init__(*args, **kwargs)
@@ -58,6 +58,7 @@ class InstitutionalTradingEnv(OrderTradingEnv):
             "unfilled_penalty": 0.05,
             "leverage_penalty": 0.1,
         }
+        self.exposure_penalty: float = exposure_penalty
         self.reward_buffer: Deque[float] = deque(maxlen=200)
 
     # ------------------------------------------------------------------
@@ -334,6 +335,7 @@ class InstitutionalTradingEnv(OrderTradingEnv):
         leverage = exposure / (account_equity + 1e-8)
         excess_leverage = max(0.0, leverage - self.leverage_limit)
         leverage_penalty = self.reward_weights["leverage_penalty"] * excess_leverage
+        exposure_penalty = self.exposure_penalty * min(leverage, self.leverage_limit)
 
         raw_reward = (
             pnl_component
@@ -341,6 +343,7 @@ class InstitutionalTradingEnv(OrderTradingEnv):
             - dd_penalty
             - unfilled_penalty
             - leverage_penalty
+            + exposure_penalty
         )
 
         self.reward_buffer.append(raw_reward)
