@@ -27,6 +27,21 @@ class _QueuedOrder:
     order: _Order
 
 
+@dataclass
+class _TBMState:
+    """Metadata describing triple-barrier configuration for a position."""
+
+    ticker_id: int
+    entry_step: int
+    entry_price: float
+    tbm_upper: float
+    tbm_lower: float
+    tbm_expiry_step: int
+    shares: int
+    tbm_label: Optional[int] = None
+    resolved: bool = False
+
+
 class InstitutionalTradingEnv(OrderTradingEnv):
     """Extended trading environment with institutional execution features.
 
@@ -39,8 +54,15 @@ class InstitutionalTradingEnv(OrderTradingEnv):
     """
 
     def __init__(self, *args, exposure_penalty: float = 0.0, **kwargs) -> None:
-        if 'num_stock_shares' not in kwargs:
-            kwargs['num_stock_shares'] = [0] * kwargs.get('stock_dim', 1)
+        if "num_stock_shares" not in kwargs:
+            kwargs["num_stock_shares"] = [0] * kwargs.get("stock_dim", 1)
+
+        self.tbm_enable: bool = kwargs.pop("tbm_enable", True)
+        self.tbm_horizon: int = kwargs.pop("tbm_horizon", 10)
+        self.tbm_up_mult: float = kwargs.pop("tbm_up_mult", 1.5)
+        self.tbm_dn_mult: float = kwargs.pop("tbm_dn_mult", 1.0)
+        self.tbm_weight: float = kwargs.pop("tbm_weight", 0.1)
+
         super().__init__(*args, **kwargs)
 
         self.slippage_coef: float = 0.0005
@@ -60,6 +82,12 @@ class InstitutionalTradingEnv(OrderTradingEnv):
         }
         self.exposure_penalty: float = exposure_penalty
         self.reward_buffer: Deque[float] = deque(maxlen=200)
+        self.tbm_states: Dict[int, _TBMState] = {}
+        self._tbm_price_history: Dict[int, Deque[float]] = {}
+        self._tbm_last_history_step: int = -1
+        self.tbm_positive_events: int = 0
+        self.tbm_negative_events: int = 0
+        self.tbm_neutral_events: int = 0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -70,6 +98,12 @@ class InstitutionalTradingEnv(OrderTradingEnv):
         self.active_queue.clear()
         self.pnl_history.clear()
         self.reward_buffer.clear()
+        self.tbm_states.clear()
+        self._tbm_price_history.clear()
+        self._tbm_last_history_step = -1
+        self.tbm_positive_events = 0
+        self.tbm_negative_events = 0
+        self.tbm_neutral_events = 0
         return observation
 
     # ------------------------------------------------------------------
@@ -287,9 +321,14 @@ class InstitutionalTradingEnv(OrderTradingEnv):
     # Reward Calculation
     # ------------------------------------------------------------------
 
-    def _calculate_reward(self) -> float:  # type: ignore[override]
+    def _calculate_reward(
+        self, resolved_positions: Optional[List[_TBMState]] = None
+    ) -> float:  # type: ignore[override]
         current_data = self._current_price_frame()
         closes = current_data["close"].to_numpy(dtype=float)
+
+        if resolved_positions is None and self.tbm_enable:
+            resolved_positions = self._update_tbm_for_positions(current_data)
 
         exposure = float(np.sum(np.abs(self.stocks) * closes))
         portfolio_value = np.dot(self.stocks, closes)
@@ -346,6 +385,19 @@ class InstitutionalTradingEnv(OrderTradingEnv):
             + exposure_penalty
         )
 
+        if self.tbm_enable and resolved_positions:
+            tbm_bonus = 0.0
+            for state in resolved_positions:
+                if state.tbm_label == 1:
+                    tbm_bonus += 1.0
+                    self.tbm_positive_events += 1
+                elif state.tbm_label == -1:
+                    tbm_bonus -= 1.0
+                    self.tbm_negative_events += 1
+                elif state.tbm_label == 0:
+                    self.tbm_neutral_events += 1
+            raw_reward += self.tbm_weight * tbm_bonus
+
         self.reward_buffer.append(raw_reward)
         buffer_array = np.array(self.reward_buffer, dtype=float)
         mean_reward = buffer_array.mean()
@@ -390,3 +442,123 @@ class InstitutionalTradingEnv(OrderTradingEnv):
             f"Equity: {equity:,.2f} | Leverage: {leverage:.2f} | Sharpe: {metrics['sharpe']:.2f} | Max DD: {metrics['max_drawdown']:.2%}"
         )
         super().render(mode=mode)
+
+    # ------------------------------------------------------------------
+    # TBM helpers
+    # ------------------------------------------------------------------
+
+    def _current_price_frame(self) -> pd.DataFrame:  # type: ignore[override]
+        frame = super()._current_price_frame()
+        if self.tbm_enable:
+            self._update_tbm_price_history(frame)
+        return frame
+
+    def _update_tbm_price_history(self, price_frame: pd.DataFrame) -> None:
+        if self._tbm_last_history_step == self.current_step:
+            return
+        self._tbm_last_history_step = self.current_step
+        closes = price_frame["close"].to_numpy(dtype=float)
+        history_len = max(self.tbm_horizon * 5, 60)
+        for idx, price in enumerate(closes):
+            history = self._tbm_price_history.get(idx)
+            if history is None:
+                history = deque(maxlen=history_len)
+                self._tbm_price_history[idx] = history
+            history.append(float(price))
+
+    def _estimate_tbm_volatility(self, ticker_id: int) -> float:
+        history = self._tbm_price_history.get(ticker_id)
+        if not history or len(history) < 2:
+            return 1e-3
+        prices = np.array(history, dtype=float)
+        prices = np.clip(prices, 1e-6, None)
+        log_returns = np.diff(np.log(prices))
+        if log_returns.size == 0:
+            return 1e-3
+        window = min(len(log_returns), max(self.tbm_horizon, 5))
+        vol = float(np.nanstd(log_returns[-window:]))
+        return max(vol, 1e-4)
+
+    def _init_tbm_state(self, ticker_id: int, entry_price: float, shares: int) -> None:
+        vol_proxy = self._estimate_tbm_volatility(ticker_id)
+        up_offset = self.tbm_up_mult * vol_proxy * entry_price
+        dn_offset = self.tbm_dn_mult * vol_proxy * entry_price
+
+        if shares >= 0:
+            upper = entry_price + up_offset
+            lower = entry_price - dn_offset
+        else:
+            upper = entry_price - up_offset
+            lower = entry_price + dn_offset
+
+        self.tbm_states[ticker_id] = _TBMState(
+            ticker_id=ticker_id,
+            entry_step=self.current_step,
+            entry_price=float(entry_price),
+            tbm_upper=float(upper),
+            tbm_lower=float(lower),
+            tbm_expiry_step=self.current_step + self.tbm_horizon,
+            shares=shares,
+        )
+
+    def _finalize_tbm_state(self, ticker_id: int, label: Optional[int] = 0) -> None:
+        state = self.tbm_states.pop(ticker_id, None)
+        if state is None:
+            return
+        state.tbm_label = label
+        state.resolved = True
+
+    def _update_tbm_for_positions(self, price_frame: pd.DataFrame) -> List[_TBMState]:
+        if not self.tbm_states:
+            return []
+
+        closes = price_frame["close"].to_numpy(dtype=float)
+        resolved: List[_TBMState] = []
+        for ticker_id, state in list(self.tbm_states.items()):
+            current_price = closes[ticker_id]
+            if state.shares >= 0:
+                hit_up = current_price >= state.tbm_upper
+                hit_down = current_price <= state.tbm_lower
+            else:
+                hit_up = current_price <= state.tbm_upper
+                hit_down = current_price >= state.tbm_lower
+            expired = self.current_step >= state.tbm_expiry_step
+
+            if hit_up:
+                state.tbm_label = 1
+                state.resolved = True
+            elif hit_down:
+                state.tbm_label = -1
+                state.resolved = True
+            elif expired:
+                state.tbm_label = 0
+                state.resolved = True
+
+            if state.resolved:
+                resolved.append(state)
+                del self.tbm_states[ticker_id]
+
+        return resolved
+
+    def _process_fill(self, order: _Order, fill_price: float) -> tuple[float, float]:  # type: ignore[override]
+        prev_position = self.positions.get(order.ticker_id)
+        prev_shares = prev_position.shares if prev_position else 0
+        realized_pnl, position_change = super()._process_fill(order, fill_price)
+
+        if self.tbm_enable:
+            self._handle_tbm_post_fill(order.ticker_id, prev_shares)
+
+        return realized_pnl, position_change
+
+    def _handle_tbm_post_fill(self, ticker_id: int, prev_shares: int) -> None:
+        position = self.positions.get(ticker_id)
+        if position is None or position.shares == 0:
+            if ticker_id in self.tbm_states:
+                self._finalize_tbm_state(ticker_id, label=0)
+            return
+
+        new_shares = position.shares
+        prev_sign = np.sign(prev_shares)
+        new_sign = np.sign(new_shares)
+        if ticker_id not in self.tbm_states or prev_shares == 0 or prev_sign != new_sign:
+            self._init_tbm_state(ticker_id, float(position.entry_price), new_shares)

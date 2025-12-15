@@ -67,6 +67,13 @@ class OrderTradingEnv(StockTradingEnv):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
+        # Defaults for TBM-related attributes so derived envs can opt-in.
+        self.tbm_enable = getattr(self, "tbm_enable", True)
+        self.tbm_horizon = getattr(self, "tbm_horizon", 10)
+        self.tbm_up_mult = getattr(self, "tbm_up_mult", 1.5)
+        self.tbm_dn_mult = getattr(self, "tbm_dn_mult", 1.0)
+        self.tbm_weight = getattr(self, "tbm_weight", 0.1)
+
         # Action space: one 5-dimensional vector per ticker
         self.action_space = gym.spaces.Box(
             low=np.array([[-1.0, -0.05, 0.0, 0.0, 0.0]] * self.stock_dim, dtype=np.float32),
