@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+import argparse
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -21,6 +22,68 @@ from oami.features import OptionFeatureBuilder, StockFeatureBuilder
 
 STOCK_DIR = Path("data/flatfiles/us_stocks_sip/day_aggs_v1")
 OPTION_DIR = Path("data/flatfiles/us_options_opra/day_aggs_v1")
+DEFAULT_TICKERS = [
+    "AAPL",
+    "MSFT",
+    "TSLA",
+    "NVDA",
+    "META",
+    "AMZN",
+    "GOOGL",
+    "JPM",
+    "UNH",
+    "JNJ",
+]
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate TBM feature predictability.")
+    parser.add_argument(
+        "--tickers",
+        nargs="*",
+        default=None,
+        help="List of tickers to include (space-separated). Defaults to liquid mega-cap basket.",
+    )
+    parser.add_argument(
+        "--tickers-file",
+        type=str,
+        default=None,
+        help="Optional text file with one ticker per line (overrides --tickers).",
+    )
+    parser.add_argument("--start", type=str, default="2025-03-01", help="Start date (YYYY-MM-DD).")
+    parser.add_argument("--end", type=str, default="2025-05-31", help="End date (YYYY-MM-DD).")
+    parser.add_argument("--tbm-horizon", type=int, default=10, help="TBM vertical barrier horizon in bars.")
+    parser.add_argument(
+        "--tbm-up-mult",
+        type=float,
+        default=1.5,
+        help="Upper barrier multiplier applied to volatility proxy.",
+    )
+    parser.add_argument(
+        "--tbm-dn-mult",
+        type=float,
+        default=1.0,
+        help="Lower barrier multiplier applied to volatility proxy.",
+    )
+    return parser.parse_args()
+
+
+def _resolve_tickers(args: argparse.Namespace) -> list[str]:
+    if args.tickers_file:
+        path = Path(args.tickers_file).expanduser()
+        if not path.exists():
+            raise FileNotFoundError(f"Ticker file not found: {path}")
+        tickers = [
+            line.strip().upper()
+            for line in path.read_text().splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        if not tickers:
+            raise ValueError(f"No tickers found in {path}")
+        return tickers
+    if args.tickers:
+        return [ticker.upper() for ticker in args.tickers]
+    return DEFAULT_TICKERS
 
 
 def iter_daily_files(base_dir: Path, start: pd.Timestamp, end: pd.Timestamp) -> Iterable[Path]:
@@ -95,6 +158,10 @@ def build_feature_matrix(
     tickers: Sequence[str],
     start: str,
     end: str,
+    *,
+    tbm_horizon: int = 10,
+    tbm_up_mult: float = 1.5,
+    tbm_dn_mult: float = 1.0,
 ) -> pd.DataFrame:
     stocks = load_stock_data(tickers, start, end)
     options = load_option_data(tickers, start, end)
@@ -113,7 +180,12 @@ def build_feature_matrix(
 
     merged = stock_features.merge(option_payload, on=["date", "tic"], how="left")
     merged = merged.sort_values(["tic", "date"]).reset_index(drop=True)
-    merged["tbm_label"] = compute_tbm_labels(merged, horizon=10, up_mult=1.5, dn_mult=1.0)
+    merged["tbm_label"] = compute_tbm_labels(
+        merged,
+        horizon=tbm_horizon,
+        up_mult=tbm_up_mult,
+        dn_mult=tbm_dn_mult,
+    )
     return merged
 
 
@@ -328,16 +400,27 @@ def build_multi_factor_alpha(
 
 
 def main() -> None:
-    TICKERS = ["AAPL"]
-    START = "2025-03-01"
-    END = "2025-05-31"
+    args = _parse_args()
+    tickers = _resolve_tickers(args)
+    start = args.start
+    end = args.end
 
-    print(f"Loading flatfiles for {TICKERS} between {START} and {END}...")
-    feature_table = build_feature_matrix(TICKERS, START, END)
+    print(f"Loading flatfiles for {tickers} between {start} and {end}...")
+    feature_table = build_feature_matrix(
+        tickers,
+        start,
+        end,
+        tbm_horizon=args.tbm_horizon,
+        tbm_up_mult=args.tbm_up_mult,
+        tbm_dn_mult=args.tbm_dn_mult,
+    )
     features, labels, feature_cols, meta = prepare_ml_inputs(feature_table)
     analysis_df = pd.concat([meta, features], axis=1)
 
     print(f"Feature matrix shape: {features.shape}, labels distribution:\n{meta['tbm_label'].value_counts()}")
+    label_by_ticker = meta.groupby("tic")["tbm_label"].value_counts().unstack(fill_value=0)
+    print("\nLabel distribution by ticker (rows=ticker, cols=TBM labels):")
+    print(label_by_ticker.to_string())
 
     mi_df = compute_mutual_information(features, labels, feature_cols)
     print("\nTop 15 Mutual Information Scores:")
